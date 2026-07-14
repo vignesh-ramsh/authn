@@ -1,0 +1,15 @@
+{
+  "system": true,
+  "fields": [
+    {"id": "AA00", "name": "id", "type": "UUID", "primary_key": true},
+    {"id": "AA01", "name": "user", "type": "REFERENCE", "target": "_users", "required": true},
+    {"id": "AA02", "name": "token_hash", "type": "STRING", "length": 128, "required": true, "unique": true},
+    {"id": "AA03", "name": "session_type", "type": "SELECT", "required": true, "default": "Fixed", "options": ["Fixed", "Extended"]},
+    {"id": "AA04", "name": "expires_at", "type": "DATETIME", "required": true},
+    {"id": "AA05", "name": "ip_address", "type": "STRING", "length": 64},
+    {"id": "AA06", "name": "user_agent", "type": "TEXT"},
+    {"id": "AA07", "name": "revoked_at", "type": "DATETIME"},
+    {"id": "AA08", "name": "last_seen_at", "type": "DATETIME"}
+  ],
+  "index": [{"key": "idx_sessions_user", "fields": ["user"]}]
+}

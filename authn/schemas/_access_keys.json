@@ -1,0 +1,16 @@
+{
+  "system": true,
+  "audit": true,
+  "fields": [
+    {"id": "AA00", "name": "id", "type": "UUID", "primary_key": true},
+    {"id": "AA01", "name": "user", "type": "REFERENCE", "target": "_users", "required": true},
+    {"id": "AA02", "name": "key_prefix", "type": "STRING", "length": 32, "required": true, "unique": true},
+    {"id": "AA03", "name": "key_hash", "type": "STRING", "length": 128, "required": true, "unique": true},
+    {"id": "AA04", "name": "label", "type": "STRING", "length": 100},
+    {"id": "AA05", "name": "scopes", "type": "JSON"},
+    {"id": "AA06", "name": "expires_at", "type": "DATETIME"},
+    {"id": "AA07", "name": "last_used_at", "type": "DATETIME"},
+    {"id": "AA08", "name": "revoked_at", "type": "DATETIME"}
+  ],
+  "index": [{"key": "idx_access_keys_user", "fields": ["user"]}]
+}

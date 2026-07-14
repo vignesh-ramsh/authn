@@ -1,0 +1,16 @@
+{
+  "system": true,
+  "audit": true,
+  "fields": [
+    {"id": "AA00", "name": "id", "type": "UUID", "primary_key": true},
+    {"id": "AA01", "name": "email", "type": "EMAIL", "length": 255, "required": true, "unique": true},
+    {"id": "AA02", "name": "password_hash", "type": "STRING", "length": 255, "required": true},
+    {"id": "AA03", "name": "status", "type": "SELECT", "required": true, "default": "Active", "options": ["Active", "Inactive", "Locked"]},
+    {"id": "AA04", "name": "has_roles", "type": "JSON"},
+    {"id": "AA05", "name": "max_sessions", "type": "INT"},
+    {"id": "AA06", "name": "allowed_ips", "type": "JSON"},
+    {"id": "AA07", "name": "failed_login_count", "type": "INT", "required": true, "default": 0},
+    {"id": "AA08", "name": "locked_until", "type": "DATETIME"},
+    {"id": "AA09", "name": "last_login_at", "type": "DATETIME"}
+  ]
+}
