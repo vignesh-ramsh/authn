@@ -43,25 +43,47 @@ def _require_identity(identity):
 
 
 @arc.relay.whitelist(methods=["POST"], roles=["Guest"], path="/login")
-async def login(email: str, password: str, session_type: str = "Fixed", client_ip: str | None = None) -> dict:
+async def login(
+    email: str | None = None,
+    username: str | None = None,
+    *,
+    password: str,
+    session_type: str = "Fixed",
+    client_ip: str | None = None,
+) -> dict:
     from argon2 import PasswordHasher
     from argon2.exceptions import VerificationError, VerifyMismatchError
 
     if session_type not in ("Fixed", "Extended"):
         arc.relay.throw("session_type must be 'Fixed' or 'Extended'", code="bad_session_type")
+    if not email and not username:
+        arc.relay.throw("email or username is required", code="identifier_required")
 
-    email = email.strip().lower()
-    # Keyed on (client_ip, email), not email alone — a self-hosted
+    # Two lookup fields, one login path — a real second capability (not
+    # every "add a field" also means "and let it authenticate with"), added
+    # because it was explicitly asked for. email stays the primary/default
+    # identifier; username is a genuine alternative, not a fallback alias.
+    if email:
+        email = email.strip().lower()
+        lookup, identifier = {"email": email}, email
+    else:
+        # Same normalization the _users validate hook applies on write
+        # (hooks/_users.py's check_username) — a case-mismatched lookup
+        # would otherwise never match the stored (lowercased) value.
+        username = username.strip().lower()
+        lookup, identifier = {"username": username}, username
+
+    # Keyed on (client_ip, identifier), not identifier alone — a self-hosted
     # deployment where every legitimate user shares one public IP would
-    # otherwise make the per-email budget the same as a single-attacker
-    # budget. The email-based account lockout below is unchanged and stays
-    # the real defense against a targeted guesser; this only bounds
-    # request *volume* per source.
-    rate_key = f"login:{client_ip or 'unknown'}:{email}"
+    # otherwise make the per-identifier budget the same as a single-attacker
+    # budget. The account lockout below is unchanged and stays the real
+    # defense against a targeted guesser; this only bounds request *volume*
+    # per source.
+    rate_key = f"login:{client_ip or 'unknown'}:{identifier}"
     if not await arc.authn.rate_limit(rate_key, limit=10, window_seconds=60):
         arc.relay.throw("too many login attempts, try again shortly", status=429, code="rate_limited")
 
-    user = await arc.relay.get("_users", {"email": email})
+    user = await arc.relay.get("_users", lookup)
 
     # Always pay exactly one Argon2 verify — against the real hash if the
     # user exists, a fixed dummy hash otherwise — so response timing can't
@@ -73,7 +95,7 @@ async def login(email: str, password: str, session_type: str = "Fixed", client_i
         password_ok = False
 
     if user is None:
-        arc.relay.throw("invalid email or password", status=401, code="invalid_credentials")
+        arc.relay.throw("invalid credentials", status=401, code="invalid_credentials")
 
     # A lock that has already expired clears the strike counter before this
     # attempt is evaluated — otherwise a single wrong password right after
@@ -103,7 +125,7 @@ async def login(email: str, password: str, session_type: str = "Fixed", client_i
         # is itself an account-enumeration/state-disclosure oracle (docs
         # Review.MD S3). A genuinely locked/inactive user sees the same
         # message as a wrong password, by design.
-        arc.relay.throw("invalid email or password", status=401, code="invalid_credentials")
+        arc.relay.throw("invalid credentials", status=401, code="invalid_credentials")
 
     await arc.relay.save(
         "_users", {"id": user["id"], "failed_login_count": 0, "locked_until": None, "last_login_at": utcnow()}

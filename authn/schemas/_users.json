@@ -11,6 +11,10 @@
     {"id": "AA06", "name": "allowed_ips", "type": "JSON"},
     {"id": "AA07", "name": "failed_login_count", "type": "INT", "required": true, "default": 0},
     {"id": "AA08", "name": "locked_until", "type": "DATETIME"},
-    {"id": "AA09", "name": "last_login_at", "type": "DATETIME"}
+    {"id": "AA09", "name": "last_login_at", "type": "DATETIME"},
+    {"id": "AA10", "name": "username", "type": "STRING", "length": 32, "unique": true},
+    {"id": "AA11", "name": "full_name", "type": "STRING", "length": 150},
+    {"id": "AA12", "name": "created_by", "type": "UUID"},
+    {"id": "AA13", "name": "updated_by", "type": "UUID"}
   ]
 }
