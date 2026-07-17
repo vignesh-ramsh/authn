@@ -450,6 +450,45 @@ def prune_sessions(
 
 
 # ------------------------------------------------------------------------ #
+# Password resets
+# ------------------------------------------------------------------------ #
+@app.command(name="prune-password-resets")
+def prune_password_resets(
+    older_than_days: int = typer.Option(7, "--older-than-days"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+) -> None:
+    """Permanently DELETE password-reset tokens older than the cutoff — a
+    row counts as inactive once it's been used (used_at set) OR its own
+    expiry has passed, whichever applies; most reset tokens are never
+    consumed at all, so expires_at alone has to count too. Never touches a
+    still-valid, unused token. Shorter default cutoff than prune-sessions
+    (7 days, not 30) — reset tokens are already short-lived (15 minutes by
+    default, authn_reset_token_ttl_minutes), so there's no reason to let
+    dead rows accumulate as long."""
+
+    async def _do() -> None:
+        cutoff = utcnow() - timedelta(days=older_than_days)
+        rows = await arc.relay.sql(
+            "SELECT id FROM _password_resets WHERE (used_at IS NOT NULL AND used_at <= $1) OR (expires_at <= $1)",
+            cutoff,
+        )
+        if not rows:
+            console.print("[dim]nothing to prune.[/dim]")
+            return
+        console.print(
+            f"About to permanently delete {len(rows)} inactive password-reset row(s) older than {older_than_days} day(s)."
+        )
+        _confirm_or_abort(yes)
+
+        ids = [r["id"] for r in rows]
+        await arc.relay.sql("DELETE FROM _password_resets WHERE id = ANY($1::uuid[])", ids)
+        console.print(f"[bold green]pruned {len(ids)} password-reset row(s).[/bold green]")
+
+    with _friendly_errors():
+        _run(_do())
+
+
+# ------------------------------------------------------------------------ #
 # Access keys
 # ------------------------------------------------------------------------ #
 @app.command(name="clear-access-key")

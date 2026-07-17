@@ -49,12 +49,20 @@ EXTENDED_SESSION_TTL_DAYS_KEY = "authn_extended_session_ttl_days"
 LOCKOUT_THRESHOLD_KEY = "authn_lockout_threshold"
 LOCKOUT_MINUTES_KEY = "authn_lockout_minutes"
 MIN_PASSWORD_SCORE_KEY = "authn_min_password_score"
+RESET_TOKEN_TTL_MINUTES_KEY = "authn_reset_token_ttl_minutes"
+# No settings key/default for this one — there is no sensible guess at this
+# instance's own public URL (unlike a TTL or a threshold), so it stays None
+# until an operator explicitly sets it. forgot_password() treats an unset
+# value the same as "mail isn't configured" — a clean, friendly refusal
+# rather than emailing a broken link.
+PUBLIC_URL_KEY = "authn_public_url"
 
 DEFAULT_SESSION_TTL_HOURS = 12
 DEFAULT_EXTENDED_SESSION_TTL_DAYS = 30
 DEFAULT_LOCKOUT_THRESHOLD = 5
 DEFAULT_LOCKOUT_MINUTES = 15
 DEFAULT_MIN_PASSWORD_SCORE = 3  # zxcvbn scores 0 (trivial) - 4 (very strong)
+DEFAULT_RESET_TOKEN_TTL_MINUTES = 15
 
 # A real row in _roles, assignable/removable via the CLI's add-role/
 # remove-role like any other role name — the only thing special about it is
@@ -212,6 +220,25 @@ class AuthnProvider:
 
     def min_password_score(self) -> int:
         return self._setting_int(MIN_PASSWORD_SCORE_KEY, DEFAULT_MIN_PASSWORD_SCORE)
+
+    def reset_token_ttl_seconds(self) -> int:
+        return self._setting_int(RESET_TOKEN_TTL_MINUTES_KEY, DEFAULT_RESET_TOKEN_TTL_MINUTES) * 60
+
+    def public_url(self) -> str | None:
+        """This instance's own externally-reachable base URL, used to build
+        the link inside a password-reset email — no protocol/host is
+        otherwise knowable server-side (nothing else in this project tracks
+        this; deliberately not derived from a request's Host header, which
+        is spoofable and not available to a whitelisted function's
+        kwargs-only signature anyway). None if never configured.
+
+        MUST include whatever path prefix the login UI is actually served
+        under, e.g. "https://myinstance.com/admin-desk" — authn stays
+        domain-blind about admin's mount point (admin.UI_PREFIX, §3.14) on
+        purpose, exactly like the kernel itself never hardcodes a plugin's
+        route; this setting's VALUE is where that knowledge has to live
+        instead, set once by whoever configures the instance."""
+        return self._kernel.settings.get(PUBLIC_URL_KEY)
 
     # ------------------------------------------------------------------ #
     # Rate limiting — redix-backed when present, in-process fallback
@@ -465,6 +492,8 @@ def register(kernel: Any) -> None:
     kernel.settings.declare(LOCKOUT_THRESHOLD_KEY)
     kernel.settings.declare(LOCKOUT_MINUTES_KEY)
     kernel.settings.declare(MIN_PASSWORD_SCORE_KEY)
+    kernel.settings.declare(RESET_TOKEN_TTL_MINUTES_KEY)
+    kernel.settings.declare(PUBLIC_URL_KEY)
 
     psqldb = kernel.get("psqldb")
     psqldb.register_model(Path(__file__).parent / "schemas")
@@ -484,7 +513,7 @@ def register(kernel: Any) -> None:
     # boot-time guard hard-requires kernel.has("authn") to already be true
     # for that (§3.3's rule) — a self-reference that only resolves if authn
     # exports itself first, before its own API file gets loaded.
-    kernel.export(CAPABILITY, provider, requires=["psqldb", "relay"], optional_requires=["redix", "gateway"])
+    kernel.export(CAPABILITY, provider, requires=["psqldb", "relay"], optional_requires=["redix", "gateway", "mail"])
 
     relay = kernel.get("relay")
     relay.register_hooks(Path(__file__).parent / "hooks")

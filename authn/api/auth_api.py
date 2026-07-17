@@ -17,7 +17,15 @@ from datetime import timedelta
 
 import arc
 
-from authn import KEY_PREFIX_LEN, SUPERUSER_ROLE_NAME, has_roles_subset, hash_token, utcnow
+from authn import (
+    KEY_PREFIX_LEN,
+    SUPERUSER_ROLE_NAME,
+    PasswordPolicyError,
+    has_roles_subset,
+    hash_token,
+    utcnow,
+    validate_password_strength,
+)
 
 _DUMMY_PASSWORD_HASH: str | None = None
 
@@ -168,17 +176,134 @@ async def logout(token: str) -> dict:
     return {"ok": True}
 
 
+_MAIL_NOT_CONFIGURED = (
+    "password reset via email is not configured on this instance — contact your administrator"
+)
+
+
 @arc.relay.whitelist(methods=["POST"], roles=["Guest"], path="/forgot-password")
-async def forgot_password(email: str) -> dict:
-    """Deliberately not implemented — sending a reset link needs a mail/
-    notification plugin that doesn't exist yet. Returns 501 immediately
-    rather than half-building token-storage machinery whose shape would
-    likely need to change once a real mail plugin exists to drive it.
-    `arc authn set-password` is the real interim recovery path today."""
-    arc.relay.throw(
-        "password reset via email is not yet available — contact your administrator",
-        status=501, code="not_implemented",
+async def forgot_password(email: str, client_ip: str | None = None) -> dict:
+    """Requires the optional `mail` plugin AND an explicitly-set
+    `authn_public_url` setting (used to build the emailed reset link) — with
+    neither, this throws a clean 501 the same shape as this endpoint's old
+    stub, rather than emailing a broken link. `arc authn set-password`
+    remains the real interim recovery path either way.
+
+    Always returns the same generic response regardless of whether `email`
+    actually has an account — same "one message regardless of why" posture
+    login() already takes (docs/Review.MD S3). Deliberately NOT extended to
+    exact timing-parity for a nonexistent email the way login()'s
+    `_dummy_hash()` is: skipping the token/DB-write/email-send for a
+    nonexistent user is a real, measurable timing difference, but "does
+    this email have an account" is a much lower-severity oracle than
+    login's own credential-guessing surface, and closing it fully would
+    mean spending a real email send on every guess. A deliberate, flagged
+    simplification, not an oversight."""
+    email = email.strip().lower()
+
+    # Keyed the same (client_ip, identifier) shape as login()'s own rate
+    # limit, and for the same reason — bounds request volume per source
+    # without collapsing every legitimate user behind one shared IP into a
+    # single attacker's budget.
+    rate_key = f"forgot-password:{client_ip or 'unknown'}:{email}"
+    if not await arc.authn.rate_limit(rate_key, limit=5, window_seconds=300):
+        arc.relay.throw("too many requests, try again shortly", status=429, code="rate_limited")
+
+    if not hasattr(arc, "mail"):
+        arc.relay.throw(_MAIL_NOT_CONFIGURED, status=501, code="not_implemented")
+
+    public_url = arc.authn.public_url()
+    if not public_url:
+        arc.relay.throw(_MAIL_NOT_CONFIGURED, status=501, code="not_implemented")
+
+    generic = {"ok": True, "message": "If that email has an account, a reset link has been sent."}
+
+    user = await arc.relay.get("_users", {"email": email})
+    if user is None or user["status"] != "Active":
+        return generic
+
+    raw_token = secrets.token_urlsafe(32)
+    ttl_seconds = arc.authn.reset_token_ttl_seconds()
+    await arc.relay.save(
+        "_password_resets",
+        {"user": user["id"], "token_hash": hash_token(raw_token), "expires_at": utcnow() + timedelta(seconds=ttl_seconds)},
     )
+
+    # Imported here, not at module top — `mail` is only an optional_requires
+    # dependency of authn (plugin.toml), so this module must stay importable
+    # with `mail` absent; the hasattr() check above guarantees it's actually
+    # installed by the time this line runs. Same narrow, precedented shape
+    # as authn.cli importing psqldb.validation.ValidationError directly.
+    from mail import AccountNotFoundError, TemplateNotFoundError
+
+    reset_url = f"{public_url.rstrip('/')}/reset-password?token={raw_token}"
+    try:
+        await arc.mail.send(
+            [email],
+            template="password_reset",
+            context={"email": email, "reset_url": reset_url, "ttl_minutes": ttl_seconds // 60},
+        )
+    except (AccountNotFoundError, TemplateNotFoundError):
+        # A real operator-configuration gap (no default MailAccount, or no
+        # "password_reset" MailTemplate row) — not something a caller's
+        # input caused, so it's safe to surface distinctly rather than
+        # folding it into the generic response above.
+        arc.relay.throw(_MAIL_NOT_CONFIGURED, status=501, code="not_implemented")
+
+    return generic
+
+
+@arc.relay.whitelist(methods=["POST"], roles=["Guest"], path="/reset-password")
+async def reset_password(token: str, new_password: str, client_ip: str | None = None) -> dict:
+    """Consumes a token minted by forgot_password(). One generic error for
+    "no such token" / "already used" / "expired" — same reasoning as
+    login()'s one generic "invalid credentials", so a caller can't
+    distinguish which case they hit."""
+    # Light defense-in-depth only — the real defense is the token's own
+    # 32-byte entropy (secrets.token_urlsafe(32)), which makes guessing it
+    # computationally infeasible regardless of rate limiting. This just
+    # blunts noisy automated scanning.
+    rate_key = f"reset-password:{client_ip or 'unknown'}"
+    if not await arc.authn.rate_limit(rate_key, limit=20, window_seconds=300):
+        arc.relay.throw("too many requests, try again shortly", status=429, code="rate_limited")
+
+    reset = await arc.relay.get("_password_resets", {"token_hash": hash_token(token)})
+    if reset is None or reset["used_at"] is not None or reset["expires_at"] <= utcnow():
+        arc.relay.throw("invalid or expired reset link", status=400, code="invalid_reset_token")
+
+    user = await arc.relay.get("_users", reset["user"])
+    if user is None:
+        arc.relay.throw("invalid or expired reset link", status=400, code="invalid_reset_token")
+
+    try:
+        validate_password_strength(new_password, min_score=arc.authn.min_password_score(), user_inputs=[user["email"]])
+    except PasswordPolicyError as exc:
+        arc.relay.throw(str(exc), status=400, code="weak_password")
+
+    from argon2 import PasswordHasher
+
+    await arc.relay.save(
+        "_users",
+        {
+            "id": user["id"], "password_hash": PasswordHasher().hash(new_password),
+            "failed_login_count": 0, "locked_until": None,
+        },
+    )
+    await arc.relay.save("_password_resets", {"id": reset["id"], "used_at": utcnow()})
+
+    # Sessions only — access keys deliberately left alone: a leaked
+    # password compromises interactive sessions, not a separately-issued
+    # API credential the user chose to create and scope themselves. Same
+    # revoke loop as `arc authn set-password` (cli.py) — a 3rd copy of it
+    # (clear-sessions is the other), not factored into a shared helper,
+    # matching this feature's own "small, matching, no premature
+    # abstraction" preference elsewhere.
+    sessions = await arc.relay.list("_sessions", filters={"user": user["id"], "revoked_at": {"is_null": True}})
+    for s in sessions:
+        await arc.relay.save("_sessions", {"id": s["id"], "revoked_at": utcnow()})
+        await arc.authn.invalidate_session_cache(s["token_hash"])
+
+    return {"ok": True}
 
 
 @arc.relay.whitelist(methods=["POST"], roles=["Guest"], path="/refresh")
