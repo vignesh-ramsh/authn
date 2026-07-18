@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import ipaddress
+import logging
 import secrets
 import time
 from dataclasses import dataclass
@@ -43,6 +45,14 @@ from typing import Any, Literal
 import arc
 
 CAPABILITY = "authn"
+
+_logger = logging.getLogger("authn")
+
+# In-process fallback dicts (_rate_local/_touch_local) are pruned once they
+# cross this size — without redix they're keyed by attacker-influenced
+# values ((client_ip, email) pairs), so "never pruned" was an unbounded,
+# externally growable memory leak.
+_FALLBACK_DICT_PRUNE_THRESHOLD = 4096
 
 SESSION_TTL_HOURS_KEY = "authn_session_ttl_hours"
 EXTENDED_SESSION_TTL_DAYS_KEY = "authn_extended_session_ttl_days"
@@ -248,9 +258,23 @@ class AuthnProvider:
     # ------------------------------------------------------------------ #
     async def rate_limit(self, key: str, limit: int, window_seconds: int) -> bool:
         if self._redix is not None:
-            return await self._redix.rate_limit(key, limit, window_seconds)
+            try:
+                return await self._redix.rate_limit(key, limit, window_seconds)
+            except Exception as exc:
+                # Redis being down must not turn every login into a 500 —
+                # fall over to the in-process counter (weaker, same fallback
+                # a redix-less install runs permanently). Account lockout is
+                # DB-backed and unaffected either way (§3.13).
+                _logger.warning("redix rate_limit failed (%s) — using in-process fallback", exc)
         async with self._rate_lock:
             now = time.monotonic()
+            # Prune expired windows once the dict grows past the threshold —
+            # keys are (client_ip, identifier) shaped, i.e. attacker-growable.
+            if len(self._rate_local) > _FALLBACK_DICT_PRUNE_THRESHOLD:
+                self._rate_local = {
+                    k: (c, start) for k, (c, start) in self._rate_local.items()
+                    if now - start < window_seconds
+                }
             count, window_start = self._rate_local.get(key, (0, now))
             if now - window_start >= window_seconds:
                 count, window_start = 0, now
@@ -264,11 +288,21 @@ class AuthnProvider:
     # _sessions/_users are always the source of truth on a miss; redix's
     # absence just means every request re-reads them directly.
     # ------------------------------------------------------------------ #
+    # Cache READS/WRITES degrade to the DB on a redix failure (the cache is
+    # only ever a speed-up over an always-correct DB path — Redis being down
+    # must not take authentication down with it, docs/Review-2026-07-17 B3).
+    # Cache INVALIDATION (invalidate_*, below) deliberately still raises:
+    # a role revocation whose cache-clear failed must roll the write back,
+    # not silently commit with a stale grant left honored (§3.13).
     async def _cache_get_session(self, token_hash: str) -> dict | None:
         if self._redix is None:
             return None
-        raw = await self._redix.get(f"session:{token_hash}")
-        return arc.codec.decode(raw) if raw else None
+        try:
+            raw = await self._redix.get(f"session:{token_hash}")
+            return arc.codec.decode(raw) if raw else None
+        except Exception as exc:
+            _logger.warning("session cache read failed (%s) — falling through to DB", exc)
+            return None
 
     async def _cache_set_session(
         self, token_hash: str, *, user_id: str, email: str, roles: list[str],
@@ -276,14 +310,17 @@ class AuthnProvider:
     ) -> None:
         if self._redix is None or ttl_seconds <= 0:
             return
-        await self._redix.set(
-            f"session:{token_hash}",
-            arc.codec.encode({
-                "user_id": user_id, "email": email, "roles": roles,
-                "status": status, "allowed_ips": allowed_ips,
-            }),
-            ex=ttl_seconds,
-        )
+        try:
+            await self._redix.set(
+                f"session:{token_hash}",
+                arc.codec.encode({
+                    "user_id": user_id, "email": email, "roles": roles,
+                    "status": status, "allowed_ips": allowed_ips,
+                }),
+                ex=ttl_seconds,
+            )
+        except Exception as exc:
+            _logger.warning("session cache write failed (%s) — continuing uncached", exc)
 
     async def invalidate_session_cache(self, token_hash: str) -> None:
         if self._redix is not None:
@@ -299,8 +336,12 @@ class AuthnProvider:
     async def _cache_get_access_key(self, prefix: str) -> dict | None:
         if self._redix is None:
             return None
-        raw = await self._redix.get(f"access_key:{prefix}")
-        return arc.codec.decode(raw) if raw else None
+        try:
+            raw = await self._redix.get(f"access_key:{prefix}")
+            return arc.codec.decode(raw) if raw else None
+        except Exception as exc:
+            _logger.warning("access-key cache read failed (%s) — falling through to DB", exc)
+            return None
 
     async def _cache_set_access_key(
         self, prefix: str, *, access_key_id: str, key_hash: str, user_id: str,
@@ -314,14 +355,17 @@ class AuthnProvider:
             ttl_seconds = max(0, min(int((expires_at - utcnow()).total_seconds()), ttl_seconds))
         if ttl_seconds <= 0:
             return
-        await self._redix.set(
-            f"access_key:{prefix}",
-            arc.codec.encode({
-                "id": access_key_id, "key_hash": key_hash, "user_id": user_id, "email": email,
-                "roles": roles, "status": status, "allowed_ips": allowed_ips,
-            }),
-            ex=ttl_seconds,
-        )
+        try:
+            await self._redix.set(
+                f"access_key:{prefix}",
+                arc.codec.encode({
+                    "id": access_key_id, "key_hash": key_hash, "user_id": user_id, "email": email,
+                    "roles": roles, "status": status, "allowed_ips": allowed_ips,
+                }),
+                ex=ttl_seconds,
+            )
+        except Exception as exc:
+            _logger.warning("access-key cache write failed (%s) — continuing uncached", exc)
 
     async def invalidate_access_key_cache(self, prefix: str) -> None:
         if self._redix is not None:
@@ -353,11 +397,22 @@ class AuthnProvider:
     async def _should_touch_last_used(self, access_key_id: str) -> bool:
         throttle_key = f"access_key_touch:{access_key_id}"
         if self._redix is not None:
-            if await self._redix.get(throttle_key):
+            try:
+                if await self._redix.get(throttle_key):
+                    return False
+                await self._redix.set(throttle_key, "1", ex=ACCESS_KEY_TOUCH_THROTTLE_SECONDS)
+                return True
+            except Exception as exc:
+                # A bookkeeping write is the last thing worth failing a
+                # request over — skip the touch entirely this round.
+                _logger.warning("last_used_at throttle check failed (%s) — skipping touch", exc)
                 return False
-            await self._redix.set(throttle_key, "1", ex=ACCESS_KEY_TOUCH_THROTTLE_SECONDS)
-            return True
         now = time.monotonic()
+        if len(self._touch_local) > _FALLBACK_DICT_PRUNE_THRESHOLD:
+            self._touch_local = {
+                k: t for k, t in self._touch_local.items()
+                if now - t < ACCESS_KEY_TOUCH_THROTTLE_SECONDS
+            }
         last = self._touch_local.get(access_key_id, 0.0)
         if now - last < ACCESS_KEY_TOUCH_THROTTLE_SECONDS:
             return False
@@ -444,7 +499,7 @@ class AuthnProvider:
 
         cached = await self._cache_get_access_key(prefix)
         if cached is not None:
-            if hash_token(raw) != cached["key_hash"]:
+            if not hmac.compare_digest(hash_token(raw), cached["key_hash"]):
                 # Prefix matched a cache entry but the secret doesn't — a
                 # definitively invalid key, no need to fall through to the DB.
                 return None
@@ -459,7 +514,7 @@ class AuthnProvider:
             return None
         if access_key["expires_at"] is not None and access_key["expires_at"] <= utcnow():
             return None
-        if hash_token(raw) != access_key["key_hash"]:
+        if not hmac.compare_digest(hash_token(raw), access_key["key_hash"]):
             return None
 
         user = await arc.relay.get("_users", access_key["user"])

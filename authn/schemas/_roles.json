@@ -4,7 +4,7 @@
     {"id": "AA00", "name": "id", "type": "UUID", "primary_key": true},
     {"id": "AA01", "name": "name", "type": "STRING", "length": 100, "required": true, "unique": true},
     {"id": "AA02", "name": "description", "type": "TEXT"},
-    {"id": "AA03", "name": "created_by", "type": "UUID"},
-    {"id": "AA04", "name": "updated_by", "type": "UUID"}
+    {"id": "AA03", "name": "created_by", "type": "STRING", "length": 255},
+    {"id": "AA04", "name": "updated_by", "type": "STRING", "length": 255}
   ]
 }

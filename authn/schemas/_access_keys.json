@@ -11,8 +11,8 @@
     {"id": "AA06", "name": "expires_at", "type": "DATETIME"},
     {"id": "AA07", "name": "last_used_at", "type": "DATETIME"},
     {"id": "AA08", "name": "revoked_at", "type": "DATETIME"},
-    {"id": "AA09", "name": "created_by", "type": "UUID"},
-    {"id": "AA10", "name": "updated_by", "type": "UUID"}
+    {"id": "AA09", "name": "created_by", "type": "STRING", "length": 255},
+    {"id": "AA10", "name": "updated_by", "type": "STRING", "length": 255}
   ],
   "index": [{"key": "idx_access_keys_user", "fields": ["user"]}]
 }

@@ -12,6 +12,7 @@ shape of gap for GET (docs/arc.MD §3.11) — this is the same class of "not
 built yet", not a new one.
 """
 
+import asyncio
 import secrets
 from datetime import timedelta
 
@@ -95,9 +96,17 @@ async def login(
 
     # Always pay exactly one Argon2 verify — against the real hash if the
     # user exists, a fixed dummy hash otherwise — so response timing can't
-    # be used to enumerate valid emails (docs/Review.MD S3).
+    # be used to enumerate valid emails (docs/Review.MD S3). Run in a
+    # worker thread: Argon2id is ~100ms of deliberate CPU+memory cost, and
+    # doing it on the event loop stalled EVERY in-flight request for the
+    # duration of every login attempt (including the dummy-hash ones an
+    # attacker can generate freely).
     try:
-        PasswordHasher().verify(user["password_hash"] if user is not None else _dummy_hash(), password)
+        await asyncio.to_thread(
+            PasswordHasher().verify,
+            user["password_hash"] if user is not None else _dummy_hash(),
+            password,
+        )
         password_ok = True
     except (VerifyMismatchError, VerificationError):
         password_ok = False
@@ -276,16 +285,22 @@ async def reset_password(token: str, new_password: str, client_ip: str | None = 
         arc.relay.throw("invalid or expired reset link", status=400, code="invalid_reset_token")
 
     try:
-        validate_password_strength(new_password, min_score=arc.authn.min_password_score(), user_inputs=[user["email"]])
+        # to_thread for the same event-loop reason as login()'s verify —
+        # zxcvbn scoring is real CPU on a Guest-reachable path.
+        await asyncio.to_thread(
+            validate_password_strength, new_password,
+            min_score=arc.authn.min_password_score(), user_inputs=[user["email"]],
+        )
     except PasswordPolicyError as exc:
         arc.relay.throw(str(exc), status=400, code="weak_password")
 
     from argon2 import PasswordHasher
 
+    new_hash = await asyncio.to_thread(PasswordHasher().hash, new_password)
     await arc.relay.save(
         "_users",
         {
-            "id": user["id"], "password_hash": PasswordHasher().hash(new_password),
+            "id": user["id"], "password_hash": new_hash,
             "failed_login_count": 0, "locked_until": None,
         },
     )
@@ -311,6 +326,15 @@ async def refresh(token: str) -> dict:
     token_hash = hash_token(token)
     session = await arc.relay.get("_sessions", {"token_hash": token_hash})
     if session is None or session["revoked_at"] is not None or session["expires_at"] <= utcnow():
+        arc.relay.throw("invalid or expired session", status=401, code="invalid_session")
+
+    # The user must still be Active to keep the chain alive — without this,
+    # a disabled/locked account could rotate a valid session indefinitely
+    # (resolve_identity blocks actual use meanwhile, but a stolen token
+    # chain kept warm survives until the account is re-activated). Same
+    # generic error as an invalid token, deliberately — no state oracle.
+    user = await arc.relay.get("_users", session["user"])
+    if user is None or user["status"] != "Active":
         arc.relay.throw("invalid or expired session", status=401, code="invalid_session")
 
     # Rotate rather than extend in place — _sessions stays an honest log of
