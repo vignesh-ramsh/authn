@@ -60,6 +60,11 @@ LOCKOUT_THRESHOLD_KEY = "authn_lockout_threshold"
 LOCKOUT_MINUTES_KEY = "authn_lockout_minutes"
 MIN_PASSWORD_SCORE_KEY = "authn_min_password_score"
 RESET_TOKEN_TTL_MINUTES_KEY = "authn_reset_token_ttl_minutes"
+# Deliberately short — this ticket only needs to survive the moment between
+# `arc authn browse-as` opening a browser and that page finishing its first
+# POST, not the "person might not check their inbox for a few minutes" window
+# a password-reset link needs.
+IMPERSONATION_TICKET_TTL_SECONDS_KEY = "authn_impersonation_ticket_ttl_seconds"
 # No settings key/default for this one — there is no sensible guess at this
 # instance's own public URL (unlike a TTL or a threshold), so it stays None
 # until an operator explicitly sets it. forgot_password() treats an unset
@@ -73,6 +78,7 @@ DEFAULT_LOCKOUT_THRESHOLD = 5
 DEFAULT_LOCKOUT_MINUTES = 15
 DEFAULT_MIN_PASSWORD_SCORE = 3  # zxcvbn scores 0 (trivial) - 4 (very strong)
 DEFAULT_RESET_TOKEN_TTL_MINUTES = 15
+DEFAULT_IMPERSONATION_TICKET_TTL_SECONDS = 60
 
 # A real row in _roles, assignable/removable via the CLI's add-role/
 # remove-role like any other role name — the only thing special about it is
@@ -129,6 +135,24 @@ def _get_header(scope: dict, name: bytes) -> bytes | None:
     for k, v in scope.get("headers", []):
         if k.lower() == name:
             return v
+    return None
+
+
+def _get_cookie(scope: dict, name: str) -> str | None:
+    """Same self-contained, scope-only reasoning as _get_header above —
+    duplicates gateway.request.cookies_from_scope's own small parse rather
+    than importing it, so authn keeps working with authentication requests
+    even in the (currently hypothetical, but real per §3.3) case of a
+    caller that isn't gateway at all."""
+    raw = _get_header(scope, b"cookie")
+    if not raw:
+        return None
+    for part in raw.decode("latin-1").split(";"):
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        if k.strip() == name:
+            return v.strip()
     return None
 
 
@@ -233,6 +257,9 @@ class AuthnProvider:
 
     def reset_token_ttl_seconds(self) -> int:
         return self._setting_int(RESET_TOKEN_TTL_MINUTES_KEY, DEFAULT_RESET_TOKEN_TTL_MINUTES) * 60
+
+    def impersonation_ticket_ttl_seconds(self) -> int:
+        return self._setting_int(IMPERSONATION_TICKET_TTL_SECONDS_KEY, DEFAULT_IMPERSONATION_TICKET_TTL_SECONDS)
 
     def public_url(self) -> str | None:
         """This instance's own externally-reachable base URL, used to build
@@ -434,13 +461,19 @@ class AuthnProvider:
     # the documented contract, identity_middleware doesn't wrap this call.
     # ------------------------------------------------------------------ #
     async def resolve_identity(self, scope: dict) -> Identity | None:
-        auth_header = _get_header(scope, b"authorization")
+        # API keys stay on their own header (X-API-Key) — a deliberately
+        # different, non-cookie transport for programmatic/non-browser
+        # callers, untouched by the session's cookie-vs-header cutover
+        # below. Sessions now live ONLY in the arc_session cookie — no
+        # Authorization: Bearer fallback for sessions at all, full cutover
+        # (a token that never touches page JS/localStorage is the entire
+        # point; keeping a header-based escape hatch would defeat it).
         api_key_header = _get_header(scope, b"x-api-key")
-
-        if auth_header is not None:
-            return await self._resolve_session(auth_header, scope)
         if api_key_header is not None:
             return await self._resolve_api_key(api_key_header, scope)
+        session_cookie = _get_cookie(scope, "arc_session")
+        if session_cookie is not None:
+            return await self._resolve_session(session_cookie, scope)
         return None
 
     def _authorize(self, allowed_ips: list[str] | None, scope: dict) -> bool:
@@ -449,11 +482,8 @@ class AuthnProvider:
         client_ip = scope.get("state", {}).get("arc_client_ip")
         return _ip_allowed(client_ip, allowed_ips)
 
-    async def _resolve_session(self, auth_header: bytes, scope: dict) -> Identity | None:
-        value = auth_header.decode("latin-1")
-        if not value.startswith("Bearer "):
-            return None
-        token = value[len("Bearer "):].strip()
+    async def _resolve_session(self, token: str, scope: dict) -> Identity | None:
+        token = token.strip()
         if not token:
             return None
         token_hash = hash_token(token)
@@ -548,6 +578,7 @@ def register(kernel: Any) -> None:
     kernel.settings.declare(LOCKOUT_MINUTES_KEY)
     kernel.settings.declare(MIN_PASSWORD_SCORE_KEY)
     kernel.settings.declare(RESET_TOKEN_TTL_MINUTES_KEY)
+    kernel.settings.declare(IMPERSONATION_TICKET_TTL_SECONDS_KEY)
     kernel.settings.declare(PUBLIC_URL_KEY)
 
     psqldb = kernel.get("psqldb")

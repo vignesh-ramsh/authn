@@ -37,7 +37,7 @@ from rich.table import Table
 # without this.
 from psqldb.validation import ValidationError
 
-from authn import PasswordPolicyError, SUPERUSER_ROLE_NAME, utcnow, validate_password_strength
+from authn import PasswordPolicyError, SUPERUSER_ROLE_NAME, hash_token, utcnow, validate_password_strength
 
 app = typer.Typer(help="Commands for the authn provider.")
 console = Console()
@@ -444,6 +444,66 @@ def prune_sessions(
         ids = [r["id"] for r in rows]
         await arc.relay.sql("DELETE FROM _sessions WHERE id = ANY($1::uuid[])", ids)
         console.print(f"[bold green]pruned {len(ids)} session row(s).[/bold green]")
+
+    with _friendly_errors():
+        _run(_do())
+
+
+# ------------------------------------------------------------------------ #
+# Impersonation
+# ------------------------------------------------------------------------ #
+@app.command(name="browse-as")
+def browse_as(email: str = typer.Option(..., "--email")) -> None:
+    """Issue a short-lived, single-use impersonation ticket for EMAIL and
+    open a browser straight into an authenticated session as that user —
+    admin/support tooling, not a normal login path. The ticket link itself
+    expires in authn_impersonation_ticket_ttl_seconds and can only ever be
+    consumed once (authn/api/auth_api.py's impersonate()); the session it
+    creates is a REAL row in _sessions, revokable the same way as any
+    other (`arc authn clear-sessions --email ...`), and shows up like any
+    other session on that user's account — this is not a hidden or
+    separately-tracked kind of access."""
+
+    async def _do() -> None:
+        user = await _get_user_or_exit(email)
+        if user["status"] != "Active":
+            err_console.print(f"{user['email']} is not Active (status={user['status']}) — cannot impersonate.")
+            raise typer.Exit(code=1)
+
+        public_url = arc.authn.public_url()
+        if not public_url:
+            err_console.print(
+                "authn_public_url is not set — browse-as needs this instance's own "
+                "externally-reachable base URL to build the impersonation link."
+            )
+            raise typer.Exit(code=1)
+
+        raw_token = secrets.token_urlsafe(32)
+        ttl_seconds = arc.authn.impersonation_ticket_ttl_seconds()
+        await arc.relay.save(
+            "_impersonation_tickets",
+            {
+                "user": user["id"], "token_hash": hash_token(raw_token),
+                "expires_at": utcnow() + timedelta(seconds=ttl_seconds),
+            },
+        )
+
+        url = f"{public_url.rstrip('/')}/impersonate?ticket={raw_token}"
+        console.print(
+            f"[bold green]opening browser as {user['email']}[/bold green] "
+            f"(link expires in {ttl_seconds}s, single-use)"
+        )
+
+        import webbrowser
+
+        opened = webbrowser.open(url)
+        if not opened:
+            # Headless/SSH session, no DISPLAY, or no registered browser —
+            # webbrowser.open() returning False (not raising) is the normal
+            # signal for this, not a bug to work around. The link is still
+            # single-use and short-lived either way; printing it is the
+            # only way this command can actually be useful in that case.
+            console.print(f"[dim]couldn't launch a browser automatically — open this link yourself:[/dim]\n{url}")
 
     with _friendly_errors():
         _run(_do())

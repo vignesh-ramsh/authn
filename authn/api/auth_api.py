@@ -13,8 +13,10 @@ built yet", not a new one.
 """
 
 import asyncio
+import json
 import secrets
 from datetime import timedelta
+from typing import Any
 
 import arc
 
@@ -49,6 +51,61 @@ def _require_identity(identity):
     if identity is None:
         arc.relay.throw("authentication required", status=401, code="unauthorized")
     return identity
+
+
+def _profile(user: dict) -> dict:
+    """The shape login()/whoami() both return — never the raw session
+    token (that only ever travels via the httpOnly Set-Cookie itself, not
+    the JSON body a script or an XSS payload could read back out)."""
+    return {
+        "email": user["email"],
+        "username": user.get("username"),
+        "full_name": user.get("full_name"),
+        "theme": user.get("theme") or "light",
+    }
+
+
+def _cookie_secure() -> bool:
+    """A Secure cookie is silently refused by the browser entirely over
+    plain HTTP — `arc run` without a reverse proxy in front serves plain
+    HTTP by default, so this has to follow whatever gateway_force_https is
+    actually set to, not just default on and quietly break local dev."""
+    return (arc.settings.get("gateway_force_https") or "").lower() in ("1", "true", "yes")
+
+
+def _session_response(content: dict, *, token: str, ttl_seconds: int):
+    """Wraps `content` in a gateway.request.Response that sets the real
+    session cookie (HttpOnly) plus a paired, JS-readable CSRF cookie — only
+    when gateway is actually installed; a direct arc.relay.call() has no
+    HTTP response to carry a Set-Cookie over, so it just gets `content`
+    back plain, same as any other whitelisted function's direct-call path.
+    Deliberately no raw-token field anywhere in `content` either way —
+    programmatic (non-browser) access to a live session was never this
+    plugin's job; that's what API access keys (X-API-Key) are for."""
+    if not hasattr(arc, "gateway"):
+        return content
+    from gateway.request import Cookie, Response
+
+    secure = _cookie_secure()
+    return Response(
+        content=content,
+        cookies=[
+            Cookie("arc_session", token, max_age=ttl_seconds, http_only=True, secure=secure),
+            Cookie("csrf_token", secrets.token_urlsafe(16), max_age=ttl_seconds, http_only=False, secure=secure),
+        ],
+    )
+
+
+def _cleared_session_response(content: dict):
+    if not hasattr(arc, "gateway"):
+        return content
+    from gateway.request import Cookie, Response
+
+    secure = _cookie_secure()
+    return Response(
+        content=content,
+        cookies=[Cookie.cleared("arc_session", secure=secure), Cookie.cleared("csrf_token", secure=secure)],
+    )
 
 
 @arc.relay.whitelist(methods=["POST"], roles=["Guest"], path="/login")
@@ -172,17 +229,122 @@ async def login(
             "_sessions",
             {"user": user["id"], "token_hash": hash_token(token), "session_type": session_type, "expires_at": expires_at},
         )
-    return {"token": token, "session_type": session_type, "expires_at": expires_at.isoformat()}
+    return _session_response(
+        _profile(user), token=token, ttl_seconds=ttl,
+    )
 
 
 @arc.relay.whitelist(methods=["POST"], roles=["Guest"], path="/logout")
-async def logout(token: str) -> dict:
-    token_hash = hash_token(token)
-    session = await arc.relay.get("_sessions", {"token_hash": token_hash})
-    if session is not None and session["revoked_at"] is None:
-        await arc.relay.save("_sessions", {"id": session["id"], "revoked_at": utcnow()})
-        await arc.authn.invalidate_session_cache(token_hash)
-    return {"ok": True}
+async def logout(cookies: dict[str, str] | None = None) -> dict:
+    token = (cookies or {}).get("arc_session")
+    if token:
+        token_hash = hash_token(token)
+        session = await arc.relay.get("_sessions", {"token_hash": token_hash})
+        if session is not None and session["revoked_at"] is None:
+            await arc.relay.save("_sessions", {"id": session["id"], "revoked_at": utcnow()})
+            await arc.authn.invalidate_session_cache(token_hash)
+    return _cleared_session_response({"ok": True})
+
+
+@arc.relay.whitelist(methods=["GET"], roles=["*"], path="/whoami")
+async def whoami(identity=None) -> dict:
+    identity = _require_identity(identity)
+    user = await arc.relay.get("_users", identity.user_id)
+    if user is None:
+        arc.relay.throw("authentication required", status=401, code="unauthorized")
+    return _profile(user)
+
+
+@arc.relay.whitelist(methods=["POST"], roles=["*"], path="/me/theme")
+async def set_my_theme(theme: str, identity=None) -> dict:
+    identity = _require_identity(identity)
+    if theme not in ("light", "dark"):
+        arc.relay.throw("theme must be 'light' or 'dark'", code="invalid_theme")
+    await arc.relay.save("_users", {"id": identity.user_id, "theme": theme})
+    return {"ok": True, "theme": theme}
+
+
+def _impersonate_html(ticket: str) -> str:
+    """A tiny, self-submitting shell page — no external resources, so it
+    works standalone with no build step. `ticket_json` is a properly
+    JSON-escaped JS string literal (json.dumps), with `</` additionally
+    neutralized so a ticket value can never prematurely close the
+    surrounding <script> tag — `ticket` arrives straight from the query
+    string, i.e. is attacker-controlled input being embedded into HTML."""
+    ticket_json = json.dumps(ticket).replace("</", "<\\/")
+    return (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        "<title>Signing in…</title></head><body>"
+        "<p>Signing you in…</p>"
+        "<script>"
+        # A stray, leftover arc_session cookie from some earlier/unrelated
+        # session (this browser doesn't have to be "fresh") makes
+        # gateway's csrf_middleware demand a matching X-CSRF-Token the
+        # instant one's present — same double-submit rule client.ts's own
+        # headers() helper already follows for every mutating call, echoed
+        # here by hand since this page has no bundle to share it from.
+        "var m=document.cookie.match(/(?:^|;\\s*)csrf_token=([^;]+)/);"
+        "var h={'Content-Type':'application/json'};"
+        "if(m)h['X-CSRF-Token']=decodeURIComponent(m[1]);"
+        "fetch('/impersonate/consume',{method:'POST',credentials:'same-origin',headers:h,"
+        "body:JSON.stringify({ticket:" + ticket_json + "})})"
+        ".then(function(res){if(!res.ok)throw new Error('invalid');window.location.replace('/');})"
+        ".catch(function(){document.body.textContent="
+        "'This impersonation link is invalid or has expired.';});"
+        "</script></body></html>"
+    )
+
+
+@arc.relay.whitelist(methods=["GET"], roles=["Guest"], path="/impersonate")
+async def impersonate(ticket: str) -> Any:
+    """Serves the self-submitting shell above — reached by a plain browser
+    navigation (the CLI opens this URL directly, and a browser can only
+    ever GET a typed/clicked link). Deliberately does NO writes itself:
+    relay treats every GET as dry-run for arc.relay.save/delete calls
+    (_wire_gateway_route's own safety net, see relay/__init__.py) — an
+    earlier version of this endpoint tried to consume the ticket and
+    create the session directly here, and relay silently rolled both
+    writes back, leaving a Set-Cookie pointing at a session that was
+    never actually persisted. The real work happens from this page's own
+    POST to /impersonate/consume below, which is a genuine, non-dry-run
+    write."""
+    if not hasattr(arc, "gateway"):
+        arc.relay.throw("this endpoint requires the gateway plugin", status=501, code="not_implemented")
+    from gateway.request import Response
+
+    return Response(content=_impersonate_html(ticket), media_type="text/html")
+
+
+@arc.relay.whitelist(methods=["POST"], roles=["Guest"], path="/impersonate/consume")
+async def impersonate_consume(ticket: str) -> Any:
+    """Consumes a single-use ticket minted by `arc authn browse-as` and
+    establishes a real session for the target user. Deliberately skips
+    login()'s own max_sessions check — this is an admin/support action
+    against another account's session budget, not a login on that user's
+    own behalf, and shouldn't be blocked by however many sessions that
+    user already has open elsewhere."""
+    ticket_hash = hash_token(ticket)
+    row = await arc.relay.get("_impersonation_tickets", {"token_hash": ticket_hash})
+    if row is None or row["used_at"] is not None or row["expires_at"] <= utcnow():
+        arc.relay.throw("invalid or expired impersonation link", status=400, code="invalid_ticket")
+
+    user = await arc.relay.get("_users", row["user"])
+    if user is None or user["status"] != "Active":
+        arc.relay.throw("invalid or expired impersonation link", status=400, code="invalid_ticket")
+
+    # Marked used BEFORE the session is created — a ticket is single-use
+    # regardless of whether session creation below succeeds; a failure
+    # partway through must never leave a still-consumable ticket behind.
+    await arc.relay.save("_impersonation_tickets", {"id": row["id"], "used_at": utcnow()})
+
+    token = secrets.token_urlsafe(32)
+    ttl = arc.authn.session_ttl_seconds("Fixed")
+    expires_at = utcnow() + timedelta(seconds=ttl)
+    await arc.relay.save(
+        "_sessions",
+        {"user": user["id"], "token_hash": hash_token(token), "session_type": "Fixed", "expires_at": expires_at},
+    )
+    return _session_response({"ok": True}, token=token, ttl_seconds=ttl)
 
 
 _MAIL_NOT_CONFIGURED = (
@@ -322,7 +484,10 @@ async def reset_password(token: str, new_password: str, client_ip: str | None = 
 
 
 @arc.relay.whitelist(methods=["POST"], roles=["Guest"], path="/refresh")
-async def refresh(token: str) -> dict:
+async def refresh(cookies: dict[str, str] | None = None) -> dict:
+    token = (cookies or {}).get("arc_session")
+    if not token:
+        arc.relay.throw("invalid or expired session", status=401, code="invalid_session")
     token_hash = hash_token(token)
     session = await arc.relay.get("_sessions", {"token_hash": token_hash})
     if session is None or session["revoked_at"] is not None or session["expires_at"] <= utcnow():
@@ -352,7 +517,7 @@ async def refresh(token: str) -> dict:
             "session_type": session["session_type"], "expires_at": expires_at,
         },
     )
-    return {"token": new_token, "session_type": session["session_type"], "expires_at": expires_at.isoformat()}
+    return _session_response({"ok": True}, token=new_token, ttl_seconds=ttl)
 
 
 @arc.relay.whitelist(methods=["POST"], roles=["*"], path="/access-keys")
