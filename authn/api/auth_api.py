@@ -38,7 +38,7 @@ def _dummy_hash() -> str:
     once lazily on first use — verified against on every login attempt for
     an email that doesn't exist, so "no such user" costs the same wall-clock
     time as "wrong password" and can't be distinguished by response timing
-    (docs/Review.MD S3)."""
+    (docs/review-2026-07-14.md S3)."""
     global _DUMMY_PASSWORD_HASH
     if _DUMMY_PASSWORD_HASH is None:
         from argon2 import PasswordHasher
@@ -153,7 +153,7 @@ async def login(
 
     # Always pay exactly one Argon2 verify — against the real hash if the
     # user exists, a fixed dummy hash otherwise — so response timing can't
-    # be used to enumerate valid emails (docs/Review.MD S3). Run in a
+    # be used to enumerate valid emails (docs/review-2026-07-14.md S3). Run in a
     # worker thread: Argon2id is ~100ms of deliberate CPU+memory cost, and
     # doing it on the event loop stalled EVERY in-flight request for the
     # duration of every login attempt (including the dummy-hash ones an
@@ -174,7 +174,7 @@ async def login(
     # A lock that has already expired clears the strike counter before this
     # attempt is evaluated — otherwise a single wrong password right after
     # expiry immediately re-locks the account (1-strike-relock, docs
-    # Review.MD L2), and failed_login_count grows without bound across
+    # review-2026-07-14.md L2), and failed_login_count grows without bound across
     # repeated lockouts instead of resetting to a fresh N-attempt budget.
     if user["locked_until"] is not None and user["locked_until"] <= utcnow():
         await arc.relay.save("_users", {"id": user["id"], "failed_login_count": 0, "locked_until": None})
@@ -197,7 +197,7 @@ async def login(
         # One generic message regardless of WHY this failed (unknown email,
         # wrong password, locked, inactive) — a distinct message per case
         # is itself an account-enumeration/state-disclosure oracle (docs
-        # Review.MD S3). A genuinely locked/inactive user sees the same
+        # review-2026-07-14.md S3). A genuinely locked/inactive user sees the same
         # message as a wrong password, by design.
         arc.relay.throw("invalid credentials", status=401, code="invalid_credentials")
 
@@ -207,7 +207,7 @@ async def login(
 
     # Count-then-insert is a race without this: two concurrent logins for
     # the same user could both see "under the cap" and both insert,
-    # exceeding max_sessions (docs/Review.MD L4). Same lock() primitive
+    # exceeding max_sessions (docs/review-2026-07-14.md L4). Same lock() primitive
     # save()'s own match_on upsert already uses — real guarantee with
     # redix installed, a weaker in-process-only one otherwise, same
     # documented tradeoff as every other arc.relay.lock() use.
@@ -362,7 +362,7 @@ async def forgot_password(email: str, client_ip: str | None = None) -> dict:
 
     Always returns the same generic response regardless of whether `email`
     actually has an account — same "one message regardless of why" posture
-    login() already takes (docs/Review.MD S3). Deliberately NOT extended to
+    login() already takes (docs/review-2026-07-14.md S3). Deliberately NOT extended to
     exact timing-parity for a nonexistent email the way login()'s
     `_dummy_hash()` is: skipping the token/DB-write/email-send for a
     nonexistent user is a real, measurable timing difference, but "does

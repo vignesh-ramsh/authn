@@ -102,7 +102,7 @@ DEFAULT_ACCESS_KEY_CACHE_TTL_SECONDS = 3600
 # How often one access key's last_used_at is allowed to actually write to
 # the DB — every cache-hit-or-miss request "uses" the key, but writing on
 # every single request doesn't scale (see auth_api's docstring / docs
-# Review.MD P1) and last_used_at doesn't need per-request precision.
+# review-2026-07-14.md P1) and last_used_at doesn't need per-request precision.
 ACCESS_KEY_TOUCH_THROTTLE_SECONDS = 300
 
 
@@ -235,31 +235,29 @@ class AuthnProvider:
         task.add_done_callback(self._background_tasks.discard)
 
     # ------------------------------------------------------------------ #
-    # Settings
+    # Settings — each key below is declare()'d with type=int in register(),
+    # so get() already returns a real int with its default applied (§1 P0);
+    # no more hand-rolled `int(raw) if raw else default` per call site.
     # ------------------------------------------------------------------ #
-    def _setting_int(self, key: str, default: int) -> int:
-        raw = self._kernel.settings.get(key)
-        return int(raw) if raw else default
-
     def session_ttl_seconds(self, session_type: str) -> int:
         if session_type == "Extended":
-            return self._setting_int(EXTENDED_SESSION_TTL_DAYS_KEY, DEFAULT_EXTENDED_SESSION_TTL_DAYS) * 86400
-        return self._setting_int(SESSION_TTL_HOURS_KEY, DEFAULT_SESSION_TTL_HOURS) * 3600
+            return self._kernel.settings.get(EXTENDED_SESSION_TTL_DAYS_KEY) * 86400
+        return self._kernel.settings.get(SESSION_TTL_HOURS_KEY) * 3600
 
     def lockout_threshold(self) -> int:
-        return self._setting_int(LOCKOUT_THRESHOLD_KEY, DEFAULT_LOCKOUT_THRESHOLD)
+        return self._kernel.settings.get(LOCKOUT_THRESHOLD_KEY)
 
     def lockout_seconds(self) -> int:
-        return self._setting_int(LOCKOUT_MINUTES_KEY, DEFAULT_LOCKOUT_MINUTES) * 60
+        return self._kernel.settings.get(LOCKOUT_MINUTES_KEY) * 60
 
     def min_password_score(self) -> int:
-        return self._setting_int(MIN_PASSWORD_SCORE_KEY, DEFAULT_MIN_PASSWORD_SCORE)
+        return self._kernel.settings.get(MIN_PASSWORD_SCORE_KEY)
 
     def reset_token_ttl_seconds(self) -> int:
-        return self._setting_int(RESET_TOKEN_TTL_MINUTES_KEY, DEFAULT_RESET_TOKEN_TTL_MINUTES) * 60
+        return self._kernel.settings.get(RESET_TOKEN_TTL_MINUTES_KEY) * 60
 
     def impersonation_ticket_ttl_seconds(self) -> int:
-        return self._setting_int(IMPERSONATION_TICKET_TTL_SECONDS_KEY, DEFAULT_IMPERSONATION_TICKET_TTL_SECONDS)
+        return self._kernel.settings.get(IMPERSONATION_TICKET_TTL_SECONDS_KEY)
 
     def public_url(self) -> str | None:
         """This instance's own externally-reachable base URL, used to build
@@ -572,14 +570,38 @@ class AuthnProvider:
 
 
 def register(kernel: Any) -> None:
-    kernel.settings.declare(SESSION_TTL_HOURS_KEY)
-    kernel.settings.declare(EXTENDED_SESSION_TTL_DAYS_KEY)
-    kernel.settings.declare(LOCKOUT_THRESHOLD_KEY)
-    kernel.settings.declare(LOCKOUT_MINUTES_KEY)
-    kernel.settings.declare(MIN_PASSWORD_SCORE_KEY)
-    kernel.settings.declare(RESET_TOKEN_TTL_MINUTES_KEY)
-    kernel.settings.declare(IMPERSONATION_TICKET_TTL_SECONDS_KEY)
-    kernel.settings.declare(PUBLIC_URL_KEY)
+    # Typed declare (§1 P0) — get() below returns a real int, defaulted,
+    # and a hand-edited non-numeric value fails at arc.boot() rather than
+    # wherever the first login/reset/impersonation call happens to land.
+    kernel.settings.declare(
+        SESSION_TTL_HOURS_KEY, type=int, default=DEFAULT_SESSION_TTL_HOURS,
+        doc="Fixed-session TTL, in hours.",
+    )
+    kernel.settings.declare(
+        EXTENDED_SESSION_TTL_DAYS_KEY, type=int, default=DEFAULT_EXTENDED_SESSION_TTL_DAYS,
+        doc="Extended-session TTL, in days.",
+    )
+    kernel.settings.declare(
+        LOCKOUT_THRESHOLD_KEY, type=int, default=DEFAULT_LOCKOUT_THRESHOLD,
+        doc="Failed login attempts before an account locks.",
+    )
+    kernel.settings.declare(
+        LOCKOUT_MINUTES_KEY, type=int, default=DEFAULT_LOCKOUT_MINUTES,
+        doc="How long a lockout lasts, in minutes.",
+    )
+    kernel.settings.declare(
+        MIN_PASSWORD_SCORE_KEY, type=int, default=DEFAULT_MIN_PASSWORD_SCORE,
+        doc="Minimum zxcvbn score (0-4) a new password must meet.",
+    )
+    kernel.settings.declare(
+        RESET_TOKEN_TTL_MINUTES_KEY, type=int, default=DEFAULT_RESET_TOKEN_TTL_MINUTES,
+        doc="Password-reset token TTL, in minutes.",
+    )
+    kernel.settings.declare(
+        IMPERSONATION_TICKET_TTL_SECONDS_KEY, type=int, default=DEFAULT_IMPERSONATION_TICKET_TTL_SECONDS,
+        doc="Impersonation ticket TTL, in seconds.",
+    )
+    kernel.settings.declare(PUBLIC_URL_KEY, doc="This instance's externally-reachable base URL.")
 
     psqldb = kernel.get("psqldb")
     psqldb.register_model(Path(__file__).parent / "schemas")

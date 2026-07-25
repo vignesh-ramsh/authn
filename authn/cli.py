@@ -12,15 +12,13 @@ connection settings straight off disk. Every mutation goes through
 `arc.relay.save()`/`arc.authn`'s own cache-invalidation helpers, never a
 raw psqldb write — a raw write would bypass the has_roles/scopes
 validation hooks (authn/hooks/) or leave a stale redix cache entry behind
-(docs/arc.MD §3.13, docs/Review.MD S1).
+(docs/arc.MD §3.13, docs/review-2026-07-14.md S1).
 """
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import secrets
-import warnings
 from datetime import timedelta
 
 import arc
@@ -48,22 +46,11 @@ err_console = Console(stderr=True, style="bold red")
 # Shared plumbing
 # ------------------------------------------------------------------------ #
 def _run(coro) -> None:
-    async def _main():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", arc.ArcAdvisory)
-            arc.boot()
-        await arc.psqldb.open()
-        has_redix = hasattr(arc, "redix")
-        if has_redix:
-            await arc.redix.open()
-        try:
-            await coro
-        finally:
-            if has_redix:
-                await arc.redix.close()
-            await arc.psqldb.close()
-
-    asyncio.run(_main())
+    # arc.runtime.run_async (§1 P0) now owns the boot-then-open-then-close
+    # dance this used to hand-roll — redix is opened only when installed,
+    # same as the old `hasattr(arc, "redix")` check, since run_async skips
+    # any capability name that isn't actually registered this boot.
+    arc.runtime.run_async(coro, open=("psqldb", "redix"))
 
 
 @contextlib.contextmanager
@@ -101,7 +88,7 @@ async def _known_roles(names: list[str]) -> list[str]:
     """Filters `names` down to ones that actually exist in _roles, printing
     a warning for each one dropped — a silent skip would hide a typo'd
     role name from the operator with nothing telling them a grant didn't
-    happen (docs/Review.MD proposal discussion)."""
+    happen (docs/review-2026-07-14.md proposal discussion)."""
     known = []
     for name in names:
         if await arc.relay.get("_roles", {"name": name}) is None:
