@@ -47,7 +47,9 @@ async def check_username(ctx):
     if any(ch.isspace() for ch in username):
         arc.relay.throw("username cannot contain whitespace", code="invalid_username")
     if username.lower() in _RESERVED_USERNAMES:
-        arc.relay.throw(f"'{username}' is a reserved username and cannot be used", code="reserved_username")
+        arc.relay.throw(
+            f"'{username}' is a reserved username and cannot be used", code="reserved_username"
+        )
     ctx.payload["username"] = username.lower()
 
 
@@ -56,7 +58,8 @@ async def invalidate_cache_on_change(ctx):
     if ctx.doc.old is None:
         return  # brand new user — no session/access-key cache entries could exist yet
     changed = any(
-        ctx.doc.old.get(field) != ctx.doc.get(field) for field in ("has_roles", "status", "allowed_ips")
+        ctx.doc.old.get(field) != ctx.doc.get(field)
+        for field in ("has_roles", "status", "allowed_ips")
     )
     if changed:
         await arc.authn.invalidate_user_cache(ctx.new["id"])

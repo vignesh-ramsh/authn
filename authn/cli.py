@@ -35,7 +35,13 @@ from rich.table import Table
 # without this.
 from psqldb.validation import ValidationError
 
-from authn import PasswordPolicyError, SUPERUSER_ROLE_NAME, hash_token, utcnow, validate_password_strength
+from authn import (
+    PasswordPolicyError,
+    SUPERUSER_ROLE_NAME,
+    hash_token,
+    utcnow,
+    validate_password_strength,
+)
 
 app = typer.Typer(help="Commands for the authn provider.")
 console = Console()
@@ -119,8 +125,14 @@ def _confirm_or_abort(yes: bool, prompt: str = "Proceed?") -> None:
 def create_user(
     email: str = typer.Option(..., "--email"),
     role: str = typer.Option("", "--role", help="Comma-separated role names."),
-    random_password: bool = typer.Option(False, "--random-password", help="Generate a password instead of prompting; printed once."),
-    superuser: bool = typer.Option(False, "--superuser", help=f"Also grant the '{SUPERUSER_ROLE_NAME}' role, creating it first if it doesn't exist yet."),
+    random_password: bool = typer.Option(
+        False, "--random-password", help="Generate a password instead of prompting; printed once."
+    ),
+    superuser: bool = typer.Option(
+        False,
+        "--superuser",
+        help=f"Also grant the '{SUPERUSER_ROLE_NAME}' role, creating it first if it doesn't exist yet.",
+    ),
 ) -> None:
     """Create a user. Prompts for a password (hidden input) unless
     --random-password is given."""
@@ -140,23 +152,35 @@ def create_user(
         if superuser:
             if await arc.relay.get("_roles", {"name": SUPERUSER_ROLE_NAME}) is None:
                 await arc.relay.save(
-                    "_roles", {"name": SUPERUSER_ROLE_NAME, "description": "Bypasses all role checks."}
+                    "_roles",
+                    {"name": SUPERUSER_ROLE_NAME, "description": "Bypasses all role checks."},
                 )
-                console.print(f"[dim]role '{SUPERUSER_ROLE_NAME}' did not exist — created it.[/dim]")
+                console.print(
+                    f"[dim]role '{SUPERUSER_ROLE_NAME}' did not exist — created it.[/dim]"
+                )
             if SUPERUSER_ROLE_NAME not in roles:
                 roles.append(SUPERUSER_ROLE_NAME)
 
-        validate_password_strength(password, min_score=arc.authn.min_password_score(), user_inputs=[email_norm])
+        validate_password_strength(
+            password, min_score=arc.authn.min_password_score(), user_inputs=[email_norm]
+        )
 
         from argon2 import PasswordHasher
 
         user = await arc.relay.save(
-            "_users", {"email": email_norm, "password_hash": PasswordHasher().hash(password), "has_roles": roles}
+            "_users",
+            {
+                "email": email_norm,
+                "password_hash": PasswordHasher().hash(password),
+                "has_roles": roles,
+            },
         )
         _warn_if_superuser(roles, email=email_norm)
         if random_password:
             console.print(f"[bold]generated password (shown once):[/bold] {password}")
-        console.print(f"[bold green]created user {user['email']}[/bold green] (id={user['id']}, roles={roles or []})")
+        console.print(
+            f"[bold green]created user {user['email']}[/bold green] (id={user['id']}, roles={roles or []})"
+        )
 
     with _friendly_errors():
         _run(_do())
@@ -190,7 +214,10 @@ def set_status(
 
 
 @app.command(name="add-role")
-def add_role(email: str = typer.Option(..., "--email"), role: str = typer.Option(..., "--role", help="Comma-separated role names.")) -> None:
+def add_role(
+    email: str = typer.Option(..., "--email"),
+    role: str = typer.Option(..., "--role", help="Comma-separated role names."),
+) -> None:
     """Add role(s) to a user — additive only, existing roles are kept.
     Idempotent: a role the user already has is silently skipped."""
 
@@ -200,7 +227,9 @@ def add_role(email: str = typer.Option(..., "--email"), role: str = typer.Option
         current = list(user.get("has_roles") or [])
         added = [r for r in requested if r not in current]
         if not added:
-            console.print("[dim]no changes — user already has every requested (existing) role.[/dim]")
+            console.print(
+                "[dim]no changes — user already has every requested (existing) role.[/dim]"
+            )
             return
         await arc.relay.save("_users", {"id": user["id"], "has_roles": [*current, *added]})
         _warn_if_superuser(added, email=user["email"])
@@ -211,7 +240,10 @@ def add_role(email: str = typer.Option(..., "--email"), role: str = typer.Option
 
 
 @app.command(name="remove-role")
-def remove_role(email: str = typer.Option(..., "--email"), role: str = typer.Option(..., "--role", help="Comma-separated role names.")) -> None:
+def remove_role(
+    email: str = typer.Option(..., "--email"),
+    role: str = typer.Option(..., "--role", help="Comma-separated role names."),
+) -> None:
     """Remove role(s) from a user, without needing to know/re-type their
     full current role list. Idempotent: a role the user doesn't have is
     silently skipped."""
@@ -242,18 +274,24 @@ def set_password(email: str = typer.Option(..., "--email")) -> None:
 
     async def _do() -> None:
         user = await _get_user_or_exit(email)
-        validate_password_strength(password, min_score=arc.authn.min_password_score(), user_inputs=[user["email"]])
+        validate_password_strength(
+            password, min_score=arc.authn.min_password_score(), user_inputs=[user["email"]]
+        )
 
         from argon2 import PasswordHasher
 
         await arc.relay.save(
             "_users",
             {
-                "id": user["id"], "password_hash": PasswordHasher().hash(password),
-                "failed_login_count": 0, "locked_until": None,
+                "id": user["id"],
+                "password_hash": PasswordHasher().hash(password),
+                "failed_login_count": 0,
+                "locked_until": None,
             },
         )
-        sessions = await arc.relay.list("_sessions", filters={"user": user["id"], "revoked_at": {"is_null": True}})
+        sessions = await arc.relay.list(
+            "_sessions", filters={"user": user["id"], "revoked_at": {"is_null": True}}
+        )
         for s in sessions:
             await arc.relay.save("_sessions", {"id": s["id"], "revoked_at": utcnow()})
             await arc.authn.invalidate_session_cache(s["token_hash"])
@@ -268,10 +306,17 @@ def set_password(email: str = typer.Option(..., "--email")) -> None:
 @app.command(name="list-users")
 def list_users(
     role: str = typer.Option(None, "--role", help="Only show users granted this role."),
-    query: str = typer.Option(None, "-q", "--query", help="Only show users whose email starts with this (case-insensitive)."),
+    query: str = typer.Option(
+        None,
+        "-q",
+        "--query",
+        help="Only show users whose email starts with this (case-insensitive).",
+    ),
 ) -> None:
     async def _do() -> None:
-        users = await arc.relay.list("_users", order_by=["email"])
+        # role/query filtering both happen client-side below — a truncated
+        # fetch would silently drop matching users, not just show fewer.
+        users = await arc.relay.list("_users", order_by=["email"], limit=None)
         if role:
             users = [u for u in users if role in (u.get("has_roles") or [])]
         if query:
@@ -283,7 +328,9 @@ def list_users(
             table.add_column(col)
         for u in users:
             table.add_row(
-                u["email"], u["status"], ", ".join(u.get("has_roles") or []) or "-",
+                u["email"],
+                u["status"],
+                ", ".join(u.get("has_roles") or []) or "-",
                 str(u["max_sessions"]) if u["max_sessions"] is not None else "unlimited",
                 str(u["locked_until"]) if u["locked_until"] else "-",
             )
@@ -298,7 +345,9 @@ def list_users(
 # Roles
 # ------------------------------------------------------------------------ #
 @app.command(name="create-role")
-def create_role(name: str = typer.Argument(...), description: str = typer.Option(None, "--description")) -> None:
+def create_role(
+    name: str = typer.Argument(...), description: str = typer.Option(None, "--description")
+) -> None:
     async def _do() -> None:
         if await arc.relay.get("_roles", {"name": name}) is not None:
             err_console.print(f"role '{name}' already exists.")
@@ -311,7 +360,9 @@ def create_role(name: str = typer.Argument(...), description: str = typer.Option
 
 
 @app.command(name="delete-role")
-def delete_role(name: str = typer.Argument(...), yes: bool = typer.Option(False, "--yes", "-y")) -> None:
+def delete_role(
+    name: str = typer.Argument(...), yes: bool = typer.Option(False, "--yes", "-y")
+) -> None:
     """Delete a role, and strip it from every user who currently has it.
     Each user's has_roles update goes through arc.relay.save(), which
     fires the existing after_save hook (authn/hooks/_users.py) — so every
@@ -326,7 +377,9 @@ def delete_role(name: str = typer.Argument(...), yes: bool = typer.Option(False,
             err_console.print(f"no role named '{name}'.")
             raise typer.Exit(code=1)
 
-        all_users = await arc.relay.list("_users", fields=["id", "email", "has_roles"])
+        # Correctness-critical: every user holding this role must be found,
+        # or delete-role would silently leave it dangling past the cap.
+        all_users = await arc.relay.list("_users", fields=["id", "email", "has_roles"], limit=None)
         affected = [u for u in all_users if name in (u.get("has_roles") or [])]
 
         if affected:
@@ -341,7 +394,9 @@ def delete_role(name: str = typer.Argument(...), yes: bool = typer.Option(False,
             await arc.relay.save("_users", {"id": u["id"], "has_roles": remaining})
 
         await arc.relay.delete("_roles", role["id"])
-        console.print(f"[bold green]deleted role '{name}'[/bold green] (removed from {len(affected)} user(s)).")
+        console.print(
+            f"[bold green]deleted role '{name}'[/bold green] (removed from {len(affected)} user(s))."
+        )
 
     with _friendly_errors():
         _run(_do())
@@ -350,7 +405,7 @@ def delete_role(name: str = typer.Argument(...), yes: bool = typer.Option(False,
 @app.command(name="list-roles")
 def list_roles() -> None:
     async def _do() -> None:
-        roles = await arc.relay.list("_roles", order_by=["name"])
+        roles = await arc.relay.list("_roles", order_by=["name"], limit=None)
         table = Table()
         table.add_column("Name")
         table.add_column("Description")
@@ -388,7 +443,9 @@ def clear_sessions(
             filters["user"] = user["id"]
             scope_desc = user["email"]
 
-        sessions = await arc.relay.list("_sessions", filters=filters)
+        # Correctness-critical: --all must catch EVERY active session, or
+        # this silently under-revokes past DEFAULT_LIST_LIMIT.
+        sessions = await arc.relay.list("_sessions", filters=filters, limit=None)
         if not sessions:
             console.print("[dim]no active sessions to clear.[/dim]")
             return
@@ -425,7 +482,9 @@ def prune_sessions(
         if not rows:
             console.print("[dim]nothing to prune.[/dim]")
             return
-        console.print(f"About to permanently delete {len(rows)} inactive session row(s) older than {older_than_days} day(s).")
+        console.print(
+            f"About to permanently delete {len(rows)} inactive session row(s) older than {older_than_days} day(s)."
+        )
         _confirm_or_abort(yes)
 
         ids = [r["id"] for r in rows]
@@ -454,7 +513,9 @@ def browse_as(email: str = typer.Option(..., "--email")) -> None:
     async def _do() -> None:
         user = await _get_user_or_exit(email)
         if user["status"] != "Active":
-            err_console.print(f"{user['email']} is not Active (status={user['status']}) — cannot impersonate.")
+            err_console.print(
+                f"{user['email']} is not Active (status={user['status']}) — cannot impersonate."
+            )
             raise typer.Exit(code=1)
 
         public_url = arc.authn.public_url()
@@ -470,7 +531,8 @@ def browse_as(email: str = typer.Option(..., "--email")) -> None:
         await arc.relay.save(
             "_impersonation_tickets",
             {
-                "user": user["id"], "token_hash": hash_token(raw_token),
+                "user": user["id"],
+                "token_hash": hash_token(raw_token),
                 "expires_at": utcnow() + timedelta(seconds=ttl_seconds),
             },
         )
@@ -490,7 +552,9 @@ def browse_as(email: str = typer.Option(..., "--email")) -> None:
             # signal for this, not a bug to work around. The link is still
             # single-use and short-lived either way; printing it is the
             # only way this command can actually be useful in that case.
-            console.print(f"[dim]couldn't launch a browser automatically — open this link yourself:[/dim]\n{url}")
+            console.print(
+                f"[dim]couldn't launch a browser automatically — open this link yourself:[/dim]\n{url}"
+            )
 
     with _friendly_errors():
         _run(_do())
@@ -540,7 +604,9 @@ def prune_password_resets(
 # ------------------------------------------------------------------------ #
 @app.command(name="clear-access-key")
 def clear_access_key(
-    key: str = typer.Argument(None, help="A specific key's prefix (the safe-to-display 'ak_...' identifier)."),
+    key: str = typer.Argument(
+        None, help="A specific key's prefix (the safe-to-display 'ak_...' identifier)."
+    ),
     email: str = typer.Option(None, "--email"),
     all_: bool = typer.Option(False, "--all"),
     yes: bool = typer.Option(False, "--yes", "-y"),
@@ -567,7 +633,9 @@ def clear_access_key(
                 user = await _get_user_or_exit(email)
                 filters["user"] = user["id"]
                 scope_desc = f"{user['email']}'s access keys"
-            keys = await arc.relay.list("_access_keys", filters=filters)
+            # Correctness-critical: --all/no-scope must catch EVERY active
+            # key, or this silently under-revokes past DEFAULT_LIST_LIMIT.
+            keys = await arc.relay.list("_access_keys", filters=filters, limit=None)
 
         if not keys:
             console.print("[dim]no active access keys to clear.[/dim]")
@@ -603,7 +671,9 @@ def prune_access_keys(
         if not rows:
             console.print("[dim]nothing to prune.[/dim]")
             return
-        console.print(f"About to permanently delete {len(rows)} inactive access key row(s) older than {older_than_days} day(s).")
+        console.print(
+            f"About to permanently delete {len(rows)} inactive access key row(s) older than {older_than_days} day(s)."
+        )
         _confirm_or_abort(yes)
 
         ids = [r["id"] for r in rows]

@@ -91,7 +91,13 @@ def _session_response(content: dict, *, token: str, ttl_seconds: int):
         content=content,
         cookies=[
             Cookie("arc_session", token, max_age=ttl_seconds, http_only=True, secure=secure),
-            Cookie("csrf_token", secrets.token_urlsafe(16), max_age=ttl_seconds, http_only=False, secure=secure),
+            Cookie(
+                "csrf_token",
+                secrets.token_urlsafe(16),
+                max_age=ttl_seconds,
+                http_only=False,
+                secure=secure,
+            ),
         ],
     )
 
@@ -104,7 +110,10 @@ def _cleared_session_response(content: dict):
     secure = _cookie_secure()
     return Response(
         content=content,
-        cookies=[Cookie.cleared("arc_session", secure=secure), Cookie.cleared("csrf_token", secure=secure)],
+        cookies=[
+            Cookie.cleared("arc_session", secure=secure),
+            Cookie.cleared("csrf_token", secure=secure),
+        ],
     )
 
 
@@ -147,7 +156,9 @@ async def login(
     # per source.
     rate_key = f"login:{client_ip or 'unknown'}:{identifier}"
     if not await arc.authn.rate_limit(rate_key, limit=10, window_seconds=60):
-        arc.relay.throw("too many login attempts, try again shortly", status=429, code="rate_limited")
+        arc.relay.throw(
+            "too many login attempts, try again shortly", status=429, code="rate_limited"
+        )
 
     user = await arc.relay.get("_users", lookup)
 
@@ -177,7 +188,9 @@ async def login(
     # review-2026-07-14.md L2), and failed_login_count grows without bound across
     # repeated lockouts instead of resetting to a fresh N-attempt budget.
     if user["locked_until"] is not None and user["locked_until"] <= utcnow():
-        await arc.relay.save("_users", {"id": user["id"], "failed_login_count": 0, "locked_until": None})
+        await arc.relay.save(
+            "_users", {"id": user["id"], "failed_login_count": 0, "locked_until": None}
+        )
         user = {**user, "failed_login_count": 0, "locked_until": None}
 
     locked = user["locked_until"] is not None and user["locked_until"] > utcnow()
@@ -202,7 +215,13 @@ async def login(
         arc.relay.throw("invalid credentials", status=401, code="invalid_credentials")
 
     await arc.relay.save(
-        "_users", {"id": user["id"], "failed_login_count": 0, "locked_until": None, "last_login_at": utcnow()}
+        "_users",
+        {
+            "id": user["id"],
+            "failed_login_count": 0,
+            "locked_until": None,
+            "last_login_at": utcnow(),
+        },
     )
 
     # Count-then-insert is a race without this: two concurrent logins for
@@ -214,12 +233,17 @@ async def login(
     async with arc.relay.lock(f"login:sessions:{user['id']}"):
         active_sessions = await arc.relay.count(
             "_sessions",
-            filters={"user": user["id"], "revoked_at": {"is_null": True}, "expires_at": {"gt": utcnow()}},
+            filters={
+                "user": user["id"],
+                "revoked_at": {"is_null": True},
+                "expires_at": {"gt": utcnow()},
+            },
         )
         if user["max_sessions"] is not None and active_sessions >= user["max_sessions"]:
             arc.relay.throw(
                 "maximum active sessions reached — log out an existing session first",
-                status=403, code="max_sessions_reached",
+                status=403,
+                code="max_sessions_reached",
             )
 
         token = secrets.token_urlsafe(32)
@@ -227,10 +251,17 @@ async def login(
         expires_at = utcnow() + timedelta(seconds=ttl)
         await arc.relay.save(
             "_sessions",
-            {"user": user["id"], "token_hash": hash_token(token), "session_type": session_type, "expires_at": expires_at},
+            {
+                "user": user["id"],
+                "token_hash": hash_token(token),
+                "session_type": session_type,
+                "expires_at": expires_at,
+            },
         )
     return _session_response(
-        _profile(user), token=token, ttl_seconds=ttl,
+        _profile(user),
+        token=token,
+        ttl_seconds=ttl,
     )
 
 
@@ -273,7 +304,7 @@ def _impersonate_html(ticket: str) -> str:
     string, i.e. is attacker-controlled input being embedded into HTML."""
     ticket_json = json.dumps(ticket).replace("</", "<\\/")
     return (
-        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        '<!doctype html><html><head><meta charset="utf-8">'
         "<title>Signing in…</title></head><body>"
         "<p>Signing you in…</p>"
         "<script>"
@@ -309,7 +340,9 @@ async def impersonate(ticket: str) -> Any:
     POST to /impersonate/consume below, which is a genuine, non-dry-run
     write."""
     if not hasattr(arc, "gateway"):
-        arc.relay.throw("this endpoint requires the gateway plugin", status=501, code="not_implemented")
+        arc.relay.throw(
+            "this endpoint requires the gateway plugin", status=501, code="not_implemented"
+        )
     from gateway.request import Response
 
     return Response(content=_impersonate_html(ticket), media_type="text/html")
@@ -342,7 +375,12 @@ async def impersonate_consume(ticket: str) -> Any:
     expires_at = utcnow() + timedelta(seconds=ttl)
     await arc.relay.save(
         "_sessions",
-        {"user": user["id"], "token_hash": hash_token(token), "session_type": "Fixed", "expires_at": expires_at},
+        {
+            "user": user["id"],
+            "token_hash": hash_token(token),
+            "session_type": "Fixed",
+            "expires_at": expires_at,
+        },
     )
     return _session_response({"ok": True}, token=token, ttl_seconds=ttl)
 
@@ -397,7 +435,11 @@ async def forgot_password(email: str, client_ip: str | None = None) -> dict:
     ttl_seconds = arc.authn.reset_token_ttl_seconds()
     await arc.relay.save(
         "_password_resets",
-        {"user": user["id"], "token_hash": hash_token(raw_token), "expires_at": utcnow() + timedelta(seconds=ttl_seconds)},
+        {
+            "user": user["id"],
+            "token_hash": hash_token(raw_token),
+            "expires_at": utcnow() + timedelta(seconds=ttl_seconds),
+        },
     )
 
     # Imported here, not at module top — `mail` is only an optional_requires
@@ -450,8 +492,10 @@ async def reset_password(token: str, new_password: str, client_ip: str | None = 
         # to_thread for the same event-loop reason as login()'s verify —
         # zxcvbn scoring is real CPU on a Guest-reachable path.
         await asyncio.to_thread(
-            validate_password_strength, new_password,
-            min_score=arc.authn.min_password_score(), user_inputs=[user["email"]],
+            validate_password_strength,
+            new_password,
+            min_score=arc.authn.min_password_score(),
+            user_inputs=[user["email"]],
         )
     except PasswordPolicyError as exc:
         arc.relay.throw(str(exc), status=400, code="weak_password")
@@ -462,8 +506,10 @@ async def reset_password(token: str, new_password: str, client_ip: str | None = 
     await arc.relay.save(
         "_users",
         {
-            "id": user["id"], "password_hash": new_hash,
-            "failed_login_count": 0, "locked_until": None,
+            "id": user["id"],
+            "password_hash": new_hash,
+            "failed_login_count": 0,
+            "locked_until": None,
         },
     )
     await arc.relay.save("_password_resets", {"id": reset["id"], "used_at": utcnow()})
@@ -475,7 +521,9 @@ async def reset_password(token: str, new_password: str, client_ip: str | None = 
     # (clear-sessions is the other), not factored into a shared helper,
     # matching this feature's own "small, matching, no premature
     # abstraction" preference elsewhere.
-    sessions = await arc.relay.list("_sessions", filters={"user": user["id"], "revoked_at": {"is_null": True}})
+    sessions = await arc.relay.list(
+        "_sessions", filters={"user": user["id"], "revoked_at": {"is_null": True}}
+    )
     for s in sessions:
         await arc.relay.save("_sessions", {"id": s["id"], "revoked_at": utcnow()})
         await arc.authn.invalidate_session_cache(s["token_hash"])
@@ -513,8 +561,10 @@ async def refresh(cookies: dict[str, str] | None = None) -> dict:
     await arc.relay.save(
         "_sessions",
         {
-            "user": session["user"], "token_hash": hash_token(new_token),
-            "session_type": session["session_type"], "expires_at": expires_at,
+            "user": session["user"],
+            "token_hash": hash_token(new_token),
+            "session_type": session["session_type"],
+            "expires_at": expires_at,
         },
     )
     return _session_response({"ok": True}, token=new_token, ttl_seconds=ttl)
@@ -541,7 +591,13 @@ async def create_access_key(label: str, scopes: list[str], identity=None) -> dic
     prefix = raw_key[:KEY_PREFIX_LEN]
     row = await arc.relay.save(
         "_access_keys",
-        {"user": identity.user_id, "key_prefix": prefix, "key_hash": hash_token(raw_key), "label": label, "scopes": scopes},
+        {
+            "user": identity.user_id,
+            "key_prefix": prefix,
+            "key_hash": hash_token(raw_key),
+            "label": label,
+            "scopes": scopes,
+        },
     )
     return {"key": raw_key, "key_prefix": prefix, "id": str(row["id"])}
 
@@ -560,7 +616,9 @@ async def revoke_access_key(key_id: str, identity=None) -> dict:
 @arc.relay.whitelist(methods=["GET"], roles=["*"], path="/sessions")
 async def list_sessions(identity=None) -> list[dict]:
     identity = _require_identity(identity)
-    rows = await arc.relay.list("_sessions", filters={"user": identity.user_id}, order_by=["-expires_at"])
+    rows = await arc.relay.list(
+        "_sessions", filters={"user": identity.user_id}, order_by=["-expires_at"]
+    )
     return [
         {
             "id": str(r["id"]),

@@ -186,7 +186,9 @@ class PasswordPolicyError(ValueError):
     pass
 
 
-def validate_password_strength(password: str, *, min_score: int, user_inputs: list[str] | None = None) -> None:
+def validate_password_strength(
+    password: str, *, min_score: int, user_inputs: list[str] | None = None
+) -> None:
     """zxcvbn-scored (real crackability heuristics — dictionary words,
     keyboard walks, personal-info substitutions) rather than regex
     complexity rules ("1 uppercase + 1 digit + 1 symbol"), which push
@@ -207,7 +209,9 @@ def validate_password_strength(password: str, *, min_score: int, user_inputs: li
         warning = feedback.get("warning") or "password is too weak"
         suggestions = "; ".join(feedback.get("suggestions") or [])
         detail = warning + (f" ({suggestions})" if suggestions else "")
-        raise PasswordPolicyError(f"password does not meet the minimum strength requirement: {detail}")
+        raise PasswordPolicyError(
+            f"password does not meet the minimum strength requirement: {detail}"
+        )
 
 
 class AuthnProvider:
@@ -297,7 +301,8 @@ class AuthnProvider:
             # keys are (client_ip, identifier) shaped, i.e. attacker-growable.
             if len(self._rate_local) > _FALLBACK_DICT_PRUNE_THRESHOLD:
                 self._rate_local = {
-                    k: (c, start) for k, (c, start) in self._rate_local.items()
+                    k: (c, start)
+                    for k, (c, start) in self._rate_local.items()
                     if now - start < window_seconds
                 }
             count, window_start = self._rate_local.get(key, (0, now))
@@ -330,18 +335,30 @@ class AuthnProvider:
             return None
 
     async def _cache_set_session(
-        self, token_hash: str, *, user_id: str, email: str, roles: list[str],
-        status: str, allowed_ips: list[str] | None, ttl_seconds: int,
+        self,
+        token_hash: str,
+        *,
+        user_id: str,
+        email: str,
+        roles: list[str],
+        status: str,
+        allowed_ips: list[str] | None,
+        ttl_seconds: int,
     ) -> None:
         if self._redix is None or ttl_seconds <= 0:
             return
         try:
             await self._redix.set(
                 f"session:{token_hash}",
-                arc.codec.encode({
-                    "user_id": user_id, "email": email, "roles": roles,
-                    "status": status, "allowed_ips": allowed_ips,
-                }),
+                arc.codec.encode(
+                    {
+                        "user_id": user_id,
+                        "email": email,
+                        "roles": roles,
+                        "status": status,
+                        "allowed_ips": allowed_ips,
+                    }
+                ),
                 ex=ttl_seconds,
             )
         except Exception as exc:
@@ -369,8 +386,16 @@ class AuthnProvider:
             return None
 
     async def _cache_set_access_key(
-        self, prefix: str, *, access_key_id: str, key_hash: str, user_id: str,
-        email: str, roles: list[str], status: str, allowed_ips: list[str] | None,
+        self,
+        prefix: str,
+        *,
+        access_key_id: str,
+        key_hash: str,
+        user_id: str,
+        email: str,
+        roles: list[str],
+        status: str,
+        allowed_ips: list[str] | None,
         expires_at: datetime | None,
     ) -> None:
         if self._redix is None:
@@ -383,10 +408,17 @@ class AuthnProvider:
         try:
             await self._redix.set(
                 f"access_key:{prefix}",
-                arc.codec.encode({
-                    "id": access_key_id, "key_hash": key_hash, "user_id": user_id, "email": email,
-                    "roles": roles, "status": status, "allowed_ips": allowed_ips,
-                }),
+                arc.codec.encode(
+                    {
+                        "id": access_key_id,
+                        "key_hash": key_hash,
+                        "user_id": user_id,
+                        "email": email,
+                        "roles": roles,
+                        "status": status,
+                        "allowed_ips": allowed_ips,
+                    }
+                ),
                 ex=ttl_seconds,
             )
         except Exception as exc:
@@ -405,10 +437,14 @@ class AuthnProvider:
     # IP-list change), never on the hot request path.
     # ------------------------------------------------------------------ #
     async def invalidate_user_cache(self, user_id: Any) -> None:
-        sessions = await arc.relay.list("_sessions", filters={"user": user_id}, fields=["token_hash"])
+        sessions = await arc.relay.list(
+            "_sessions", filters={"user": user_id}, fields=["token_hash"]
+        )
         for s in sessions:
             await self.invalidate_session_cache(s["token_hash"])
-        keys = await arc.relay.list("_access_keys", filters={"user": user_id}, fields=["key_prefix"])
+        keys = await arc.relay.list(
+            "_access_keys", filters={"user": user_id}, fields=["key_prefix"]
+        )
         for k in keys:
             await self.invalidate_access_key_cache(k["key_prefix"])
 
@@ -435,7 +471,8 @@ class AuthnProvider:
         now = time.monotonic()
         if len(self._touch_local) > _FALLBACK_DICT_PRUNE_THRESHOLD:
             self._touch_local = {
-                k: t for k, t in self._touch_local.items()
+                k: t
+                for k, t in self._touch_local.items()
                 if now - t < ACCESS_KEY_TOUCH_THROTTLE_SECONDS
             }
         last = self._touch_local.get(access_key_id, 0.0)
@@ -448,9 +485,13 @@ class AuthnProvider:
         # Fire-and-forget from resolve_identity's perspective — a write
         # failure here must never break authentication itself.
         try:
-            await arc.relay.sql('UPDATE "_access_keys" SET last_used_at = $1 WHERE id = $2', utcnow(), access_key_id)
+            await arc.relay.sql(
+                'UPDATE "_access_keys" SET last_used_at = $1 WHERE id = $2', utcnow(), access_key_id
+            )
         except Exception as exc:
-            arc.relay.log(f"authn: failed to update access key last_used_at: {exc}", level="warning")
+            arc.relay.log(
+                f"authn: failed to update access key last_used_at: {exc}", level="warning"
+            )
 
     # ------------------------------------------------------------------ #
     # Identity resolution — the contract gateway's identity_middleware
@@ -488,12 +529,23 @@ class AuthnProvider:
 
         cached = await self._cache_get_session(token_hash)
         if cached is not None:
-            if cached["status"] != "Active" or not self._authorize(cached.get("allowed_ips"), scope):
+            if cached["status"] != "Active" or not self._authorize(
+                cached.get("allowed_ips"), scope
+            ):
                 return None
-            return Identity(user_id=cached["user_id"], email=cached["email"], roles=cached["roles"], auth_method="session")
+            return Identity(
+                user_id=cached["user_id"],
+                email=cached["email"],
+                roles=cached["roles"],
+                auth_method="session",
+            )
 
         session = await arc.relay.get("_sessions", {"token_hash": token_hash})
-        if session is None or session["revoked_at"] is not None or session["expires_at"] <= utcnow():
+        if (
+            session is None
+            or session["revoked_at"] is not None
+            or session["expires_at"] <= utcnow()
+        ):
             return None
 
         user = await arc.relay.get("_users", session["user"])
@@ -511,8 +563,13 @@ class AuthnProvider:
         user_id = str(user["id"])
         ttl_remaining = int((session["expires_at"] - utcnow()).total_seconds())
         await self._cache_set_session(
-            token_hash, user_id=user_id, email=user["email"], roles=roles,
-            status=user["status"], allowed_ips=user.get("allowed_ips"), ttl_seconds=ttl_remaining,
+            token_hash,
+            user_id=user_id,
+            email=user["email"],
+            roles=roles,
+            status=user["status"],
+            allowed_ips=user.get("allowed_ips"),
+            ttl_seconds=ttl_remaining,
         )
 
         if user["status"] != "Active" or not self._authorize(user.get("allowed_ips"), scope):
@@ -533,9 +590,16 @@ class AuthnProvider:
                 return None
             if await self._should_touch_last_used(cached["id"]):
                 self._spawn(self._touch_last_used(cached["id"]))
-            if cached["status"] != "Active" or not self._authorize(cached.get("allowed_ips"), scope):
+            if cached["status"] != "Active" or not self._authorize(
+                cached.get("allowed_ips"), scope
+            ):
                 return None
-            return Identity(user_id=cached["user_id"], email=cached["email"], roles=cached["roles"], auth_method="api_key")
+            return Identity(
+                user_id=cached["user_id"],
+                email=cached["email"],
+                roles=cached["roles"],
+                auth_method="api_key",
+            )
 
         access_key = await arc.relay.get("_access_keys", {"key_prefix": prefix})
         if access_key is None or access_key["revoked_at"] is not None:
@@ -556,8 +620,14 @@ class AuthnProvider:
         access_key_id = str(access_key["id"])
 
         await self._cache_set_access_key(
-            prefix, access_key_id=access_key_id, key_hash=access_key["key_hash"], user_id=str(user["id"]),
-            email=user["email"], roles=roles, status=user["status"], allowed_ips=user.get("allowed_ips"),
+            prefix,
+            access_key_id=access_key_id,
+            key_hash=access_key["key_hash"],
+            user_id=str(user["id"]),
+            email=user["email"],
+            roles=roles,
+            status=user["status"],
+            allowed_ips=user.get("allowed_ips"),
             expires_at=access_key["expires_at"],
         )
 
@@ -566,7 +636,9 @@ class AuthnProvider:
 
         if user["status"] != "Active" or not self._authorize(user.get("allowed_ips"), scope):
             return None
-        return Identity(user_id=str(user["id"]), email=user["email"], roles=roles, auth_method="api_key")
+        return Identity(
+            user_id=str(user["id"]), email=user["email"], roles=roles, auth_method="api_key"
+        )
 
 
 def register(kernel: Any) -> None:
@@ -574,31 +646,45 @@ def register(kernel: Any) -> None:
     # and a hand-edited non-numeric value fails at arc.boot() rather than
     # wherever the first login/reset/impersonation call happens to land.
     kernel.settings.declare(
-        SESSION_TTL_HOURS_KEY, type=int, default=DEFAULT_SESSION_TTL_HOURS,
+        SESSION_TTL_HOURS_KEY,
+        type=int,
+        default=DEFAULT_SESSION_TTL_HOURS,
         doc="Fixed-session TTL, in hours.",
     )
     kernel.settings.declare(
-        EXTENDED_SESSION_TTL_DAYS_KEY, type=int, default=DEFAULT_EXTENDED_SESSION_TTL_DAYS,
+        EXTENDED_SESSION_TTL_DAYS_KEY,
+        type=int,
+        default=DEFAULT_EXTENDED_SESSION_TTL_DAYS,
         doc="Extended-session TTL, in days.",
     )
     kernel.settings.declare(
-        LOCKOUT_THRESHOLD_KEY, type=int, default=DEFAULT_LOCKOUT_THRESHOLD,
+        LOCKOUT_THRESHOLD_KEY,
+        type=int,
+        default=DEFAULT_LOCKOUT_THRESHOLD,
         doc="Failed login attempts before an account locks.",
     )
     kernel.settings.declare(
-        LOCKOUT_MINUTES_KEY, type=int, default=DEFAULT_LOCKOUT_MINUTES,
+        LOCKOUT_MINUTES_KEY,
+        type=int,
+        default=DEFAULT_LOCKOUT_MINUTES,
         doc="How long a lockout lasts, in minutes.",
     )
     kernel.settings.declare(
-        MIN_PASSWORD_SCORE_KEY, type=int, default=DEFAULT_MIN_PASSWORD_SCORE,
+        MIN_PASSWORD_SCORE_KEY,
+        type=int,
+        default=DEFAULT_MIN_PASSWORD_SCORE,
         doc="Minimum zxcvbn score (0-4) a new password must meet.",
     )
     kernel.settings.declare(
-        RESET_TOKEN_TTL_MINUTES_KEY, type=int, default=DEFAULT_RESET_TOKEN_TTL_MINUTES,
+        RESET_TOKEN_TTL_MINUTES_KEY,
+        type=int,
+        default=DEFAULT_RESET_TOKEN_TTL_MINUTES,
         doc="Password-reset token TTL, in minutes.",
     )
     kernel.settings.declare(
-        IMPERSONATION_TICKET_TTL_SECONDS_KEY, type=int, default=DEFAULT_IMPERSONATION_TICKET_TTL_SECONDS,
+        IMPERSONATION_TICKET_TTL_SECONDS_KEY,
+        type=int,
+        default=DEFAULT_IMPERSONATION_TICKET_TTL_SECONDS,
         doc="Impersonation ticket TTL, in seconds.",
     )
     kernel.settings.declare(PUBLIC_URL_KEY, doc="This instance's externally-reachable base URL.")
@@ -621,7 +707,12 @@ def register(kernel: Any) -> None:
     # boot-time guard hard-requires kernel.has("authn") to already be true
     # for that (§3.3's rule) — a self-reference that only resolves if authn
     # exports itself first, before its own API file gets loaded.
-    kernel.export(CAPABILITY, provider, requires=["psqldb", "relay"], optional_requires=["redix", "gateway", "mail"])
+    kernel.export(
+        CAPABILITY,
+        provider,
+        requires=["psqldb", "relay"],
+        optional_requires=["redix", "gateway", "mail"],
+    )
 
     relay = kernel.get("relay")
     relay.register_hooks(Path(__file__).parent / "hooks")

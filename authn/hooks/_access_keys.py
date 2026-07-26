@@ -17,4 +17,6 @@ async def check_scopes(ctx):
     if user is None:
         arc.relay.throw("access key must reference an existing user", code="unknown_user")
     if not has_roles_subset(ctx.payload.get("scopes"), user.get("has_roles")):
-        arc.relay.throw("scopes must be a subset of the owning user's has_roles", code="invalid_scopes")
+        arc.relay.throw(
+            "scopes must be a subset of the owning user's has_roles", code="invalid_scopes"
+        )
