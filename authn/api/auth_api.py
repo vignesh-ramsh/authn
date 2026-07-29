@@ -160,7 +160,10 @@ async def login(
             "too many login attempts, try again shortly", status=429, code="rate_limited"
         )
 
-    user = await arc.relay.get("_users", lookup)
+    # Internal use only — verified against, never returned directly
+    # (see _profile()'s own curated shape below, the only thing login()
+    # ever hands back).
+    user = await arc.relay.get("_users", lookup, arc.relay.all_columns("_users"))
 
     # Always pay exactly one Argon2 verify — against the real hash if the
     # user exists, a fixed dummy hash otherwise — so response timing can't
@@ -270,7 +273,9 @@ async def logout(cookies: dict[str, str] | None = None) -> dict:
     token = (cookies or {}).get("arc_session")
     if token:
         token_hash = hash_token(token)
-        session = await arc.relay.get("_sessions", {"token_hash": token_hash})
+        session = await arc.relay.get(
+            "_sessions", {"token_hash": token_hash}, ["id", "revoked_at"]
+        )
         if session is not None and session["revoked_at"] is None:
             await arc.relay.save("_sessions", {"id": session["id"], "revoked_at": utcnow()})
             await arc.authn.invalidate_session_cache(token_hash)
@@ -280,7 +285,9 @@ async def logout(cookies: dict[str, str] | None = None) -> dict:
 @arc.relay.whitelist(methods=["GET"], roles=["*"], path="/whoami")
 async def whoami(identity=None) -> dict:
     identity = _require_identity(identity)
-    user = await arc.relay.get("_users", identity.user_id)
+    user = await arc.relay.get(
+        "_users", identity.user_id, ["email", "username", "full_name", "theme"]
+    )
     if user is None:
         arc.relay.throw("authentication required", status=401, code="unauthorized")
     return _profile(user)
@@ -357,11 +364,15 @@ async def impersonate_consume(ticket: str) -> Any:
     own behalf, and shouldn't be blocked by however many sessions that
     user already has open elsewhere."""
     ticket_hash = hash_token(ticket)
-    row = await arc.relay.get("_impersonation_tickets", {"token_hash": ticket_hash})
+    row = await arc.relay.get(
+        "_impersonation_tickets",
+        {"token_hash": ticket_hash},
+        ["id", "used_at", "expires_at", "user"],
+    )
     if row is None or row["used_at"] is not None or row["expires_at"] <= utcnow():
         arc.relay.throw("invalid or expired impersonation link", status=400, code="invalid_ticket")
 
-    user = await arc.relay.get("_users", row["user"])
+    user = await arc.relay.get("_users", row["user"], ["id", "status"])
     if user is None or user["status"] != "Active":
         arc.relay.throw("invalid or expired impersonation link", status=400, code="invalid_ticket")
 
@@ -427,7 +438,7 @@ async def forgot_password(email: str, client_ip: str | None = None) -> dict:
 
     generic = {"ok": True, "message": "If that email has an account, a reset link has been sent."}
 
-    user = await arc.relay.get("_users", {"email": email})
+    user = await arc.relay.get("_users", {"email": email}, ["id", "status"])
     if user is None or user["status"] != "Active":
         return generic
 
@@ -480,11 +491,15 @@ async def reset_password(token: str, new_password: str, client_ip: str | None = 
     if not await arc.authn.rate_limit(rate_key, limit=20, window_seconds=300):
         arc.relay.throw("too many requests, try again shortly", status=429, code="rate_limited")
 
-    reset = await arc.relay.get("_password_resets", {"token_hash": hash_token(token)})
+    reset = await arc.relay.get(
+        "_password_resets",
+        {"token_hash": hash_token(token)},
+        ["id", "used_at", "expires_at", "user"],
+    )
     if reset is None or reset["used_at"] is not None or reset["expires_at"] <= utcnow():
         arc.relay.throw("invalid or expired reset link", status=400, code="invalid_reset_token")
 
-    user = await arc.relay.get("_users", reset["user"])
+    user = await arc.relay.get("_users", reset["user"], ["id", "email"])
     if user is None:
         arc.relay.throw("invalid or expired reset link", status=400, code="invalid_reset_token")
 
@@ -522,7 +537,9 @@ async def reset_password(token: str, new_password: str, client_ip: str | None = 
     # matching this feature's own "small, matching, no premature
     # abstraction" preference elsewhere.
     sessions = await arc.relay.list(
-        "_sessions", filters={"user": user["id"], "revoked_at": {"is_null": True}}
+        "_sessions",
+        fields=["id", "token_hash"],
+        filters={"user": user["id"], "revoked_at": {"is_null": True}},
     )
     for s in sessions:
         await arc.relay.save("_sessions", {"id": s["id"], "revoked_at": utcnow()})
@@ -537,7 +554,11 @@ async def refresh(cookies: dict[str, str] | None = None) -> dict:
     if not token:
         arc.relay.throw("invalid or expired session", status=401, code="invalid_session")
     token_hash = hash_token(token)
-    session = await arc.relay.get("_sessions", {"token_hash": token_hash})
+    session = await arc.relay.get(
+        "_sessions",
+        {"token_hash": token_hash},
+        ["id", "revoked_at", "expires_at", "user", "session_type"],
+    )
     if session is None or session["revoked_at"] is not None or session["expires_at"] <= utcnow():
         arc.relay.throw("invalid or expired session", status=401, code="invalid_session")
 
@@ -546,7 +567,7 @@ async def refresh(cookies: dict[str, str] | None = None) -> dict:
     # (resolve_identity blocks actual use meanwhile, but a stolen token
     # chain kept warm survives until the account is re-activated). Same
     # generic error as an invalid token, deliberately — no state oracle.
-    user = await arc.relay.get("_users", session["user"])
+    user = await arc.relay.get("_users", session["user"], ["id", "status"])
     if user is None or user["status"] != "Active":
         arc.relay.throw("invalid or expired session", status=401, code="invalid_session")
 
@@ -605,7 +626,7 @@ async def create_access_key(label: str, scopes: list[str], identity=None) -> dic
 @arc.relay.whitelist(methods=["POST"], roles=["*"], path="/access-keys/revoke")
 async def revoke_access_key(key_id: str, identity=None) -> dict:
     identity = _require_identity(identity)
-    row = await arc.relay.get("_access_keys", key_id)
+    row = await arc.relay.get("_access_keys", key_id, ["user", "key_prefix"])
     if row is None or str(row["user"]) != identity.user_id:
         arc.relay.throw("no such access key", status=404, code="not_found")
     await arc.relay.save("_access_keys", {"id": key_id, "revoked_at": utcnow()})
@@ -617,7 +638,10 @@ async def revoke_access_key(key_id: str, identity=None) -> dict:
 async def list_sessions(identity=None) -> list[dict]:
     identity = _require_identity(identity)
     rows = await arc.relay.list(
-        "_sessions", filters={"user": identity.user_id}, order_by=["-expires_at"]
+        "_sessions",
+        fields=["id", "session_type", "expires_at", "revoked_at", "ip_address"],
+        filters={"user": identity.user_id},
+        order_by=["-expires_at"],
     )
     return [
         {
@@ -634,7 +658,7 @@ async def list_sessions(identity=None) -> list[dict]:
 @arc.relay.whitelist(methods=["POST"], roles=["*"], path="/sessions/revoke")
 async def revoke_session(session_id: str, identity=None) -> dict:
     identity = _require_identity(identity)
-    row = await arc.relay.get("_sessions", session_id)
+    row = await arc.relay.get("_sessions", session_id, ["user", "token_hash"])
     if row is None or str(row["user"]) != identity.user_id:
         arc.relay.throw("no such session", status=404, code="not_found")
     await arc.relay.save("_sessions", {"id": session_id, "revoked_at": utcnow()})

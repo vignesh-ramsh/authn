@@ -83,7 +83,14 @@ def _parse_csv(raw: str) -> list[str]:
 
 
 async def _get_user_or_exit(email: str) -> dict:
-    user = await arc.relay.get("_users", {"email": email.strip().lower()})
+    # CLI-internal, operator-run tool, not an HTTP response boundary — the
+    # different commands sharing this helper each read different fields
+    # (id/email/status/has_roles), so the safe, correct choice is the
+    # whole row rather than trying to guess a subset that covers every
+    # caller.
+    user = await arc.relay.get(
+        "_users", {"email": email.strip().lower()}, arc.relay.all_columns("_users")
+    )
     if user is None:
         err_console.print(f"no user with email '{email}'.")
         raise typer.Exit(code=1)
@@ -97,7 +104,7 @@ async def _known_roles(names: list[str]) -> list[str]:
     happen (docs/review-2026-07-14.md proposal discussion)."""
     known = []
     for name in names:
-        if await arc.relay.get("_roles", {"name": name}) is None:
+        if await arc.relay.get("_roles", {"name": name}, ["id"]) is None:
             console.print(f"[yellow]warning:[/yellow] role '{name}' does not exist, skipping.")
         else:
             known.append(name)
@@ -144,13 +151,13 @@ def create_user(
         password = typer.prompt("Password", hide_input=True, confirmation_prompt=True)
 
     async def _do() -> None:
-        if await arc.relay.get("_users", {"email": email_norm}) is not None:
+        if await arc.relay.get("_users", {"email": email_norm}, ["id"]) is not None:
             err_console.print(f"a user with email '{email_norm}' already exists.")
             raise typer.Exit(code=1)
 
         roles = await _known_roles(_parse_csv(role))
         if superuser:
-            if await arc.relay.get("_roles", {"name": SUPERUSER_ROLE_NAME}) is None:
+            if await arc.relay.get("_roles", {"name": SUPERUSER_ROLE_NAME}, ["id"]) is None:
                 await arc.relay.save(
                     "_roles",
                     {"name": SUPERUSER_ROLE_NAME, "description": "Bypasses all role checks."},
@@ -316,7 +323,12 @@ def list_users(
     async def _do() -> None:
         # role/query filtering both happen client-side below — a truncated
         # fetch would silently drop matching users, not just show fewer.
-        users = await arc.relay.list("_users", order_by=["email"], limit=None)
+        users = await arc.relay.list(
+            "_users",
+            fields=["email", "status", "has_roles", "max_sessions", "locked_until"],
+            order_by=["email"],
+            limit=None,
+        )
         if role:
             users = [u for u in users if role in (u.get("has_roles") or [])]
         if query:
@@ -349,7 +361,7 @@ def create_role(
     name: str = typer.Argument(...), description: str = typer.Option(None, "--description")
 ) -> None:
     async def _do() -> None:
-        if await arc.relay.get("_roles", {"name": name}) is not None:
+        if await arc.relay.get("_roles", {"name": name}, ["id"]) is not None:
             err_console.print(f"role '{name}' already exists.")
             raise typer.Exit(code=1)
         row = await arc.relay.save("_roles", {"name": name, "description": description})
@@ -372,7 +384,7 @@ def delete_role(
     re-runnable if interrupted partway through."""
 
     async def _do() -> None:
-        role = await arc.relay.get("_roles", {"name": name})
+        role = await arc.relay.get("_roles", {"name": name}, ["id"])
         if role is None:
             err_console.print(f"no role named '{name}'.")
             raise typer.Exit(code=1)
@@ -405,7 +417,9 @@ def delete_role(
 @app.command(name="list-roles")
 def list_roles() -> None:
     async def _do() -> None:
-        roles = await arc.relay.list("_roles", order_by=["name"], limit=None)
+        roles = await arc.relay.list(
+            "_roles", fields=["name", "description"], order_by=["name"], limit=None
+        )
         table = Table()
         table.add_column("Name")
         table.add_column("Description")
@@ -445,7 +459,9 @@ def clear_sessions(
 
         # Correctness-critical: --all must catch EVERY active session, or
         # this silently under-revokes past DEFAULT_LIST_LIMIT.
-        sessions = await arc.relay.list("_sessions", filters=filters, limit=None)
+        sessions = await arc.relay.list(
+            "_sessions", fields=["id", "token_hash"], filters=filters, limit=None
+        )
         if not sessions:
             console.print("[dim]no active sessions to clear.[/dim]")
             return
@@ -620,7 +636,9 @@ def clear_access_key(
 
     async def _do() -> None:
         if key:
-            row = await arc.relay.get("_access_keys", {"key_prefix": key})
+            row = await arc.relay.get(
+                "_access_keys", {"key_prefix": key}, ["id", "key_prefix", "revoked_at"]
+            )
             if row is None:
                 err_console.print(f"no access key with prefix '{key}'.")
                 raise typer.Exit(code=1)
@@ -635,7 +653,12 @@ def clear_access_key(
                 scope_desc = f"{user['email']}'s access keys"
             # Correctness-critical: --all/no-scope must catch EVERY active
             # key, or this silently under-revokes past DEFAULT_LIST_LIMIT.
-            keys = await arc.relay.list("_access_keys", filters=filters, limit=None)
+            keys = await arc.relay.list(
+                "_access_keys",
+                fields=["id", "key_prefix", "revoked_at"],
+                filters=filters,
+                limit=None,
+            )
 
         if not keys:
             console.print("[dim]no active access keys to clear.[/dim]")

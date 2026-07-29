@@ -540,7 +540,9 @@ class AuthnProvider:
                 auth_method="session",
             )
 
-        session = await arc.relay.get("_sessions", {"token_hash": token_hash})
+        session = await arc.relay.get(
+            "_sessions", {"token_hash": token_hash}, ["revoked_at", "expires_at", "user"]
+        )
         if (
             session is None
             or session["revoked_at"] is not None
@@ -548,7 +550,9 @@ class AuthnProvider:
         ):
             return None
 
-        user = await arc.relay.get("_users", session["user"])
+        user = await arc.relay.get(
+            "_users", session["user"], ["id", "email", "has_roles", "status", "allowed_ips"]
+        )
         if user is None:
             return None
 
@@ -601,7 +605,11 @@ class AuthnProvider:
                 auth_method="api_key",
             )
 
-        access_key = await arc.relay.get("_access_keys", {"key_prefix": prefix})
+        access_key = await arc.relay.get(
+            "_access_keys",
+            {"key_prefix": prefix},
+            ["id", "revoked_at", "expires_at", "key_hash", "user", "scopes"],
+        )
         if access_key is None or access_key["revoked_at"] is not None:
             return None
         if access_key["expires_at"] is not None and access_key["expires_at"] <= utcnow():
@@ -609,7 +617,9 @@ class AuthnProvider:
         if not hmac.compare_digest(hash_token(raw), access_key["key_hash"]):
             return None
 
-        user = await arc.relay.get("_users", access_key["user"])
+        user = await arc.relay.get(
+            "_users", access_key["user"], ["id", "email", "has_roles", "status", "allowed_ips"]
+        )
         if user is None:
             return None
 

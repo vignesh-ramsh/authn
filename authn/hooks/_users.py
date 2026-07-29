@@ -20,7 +20,7 @@ _RESERVED_USERNAMES = frozenset({"admin", "administrator", "guest"})
 @arc.relay.validate
 async def check_has_roles(ctx):
     for role_name in ctx.payload.get("has_roles") or []:
-        if await arc.relay.get("_roles", {"name": role_name}) is None:
+        if await arc.relay.get("_roles", {"name": role_name}, ["id"]) is None:
             arc.relay.throw(f"no role named '{role_name}'", code="unknown_role")
 
 
