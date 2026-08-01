@@ -97,13 +97,10 @@
     {
       "id": "AA14",
       "name": "theme",
-      "type": "SELECT",
+      "type": "STRING",
+      "length": 60,
       "required": true,
-      "default": "light",
-      "options": [
-        "light",
-        "dark"
-      ]
+      "default": "Daylight"
     }
   ]
 }

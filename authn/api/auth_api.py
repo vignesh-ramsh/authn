@@ -61,7 +61,7 @@ def _profile(user: dict) -> dict:
         "email": user["email"],
         "username": user.get("username"),
         "full_name": user.get("full_name"),
-        "theme": user.get("theme") or "light",
+        "theme": user.get("theme") or "Daylight",
     }
 
 
@@ -295,9 +295,17 @@ async def whoami(identity=None) -> dict:
 
 @arc.relay.whitelist(methods=["POST"], roles=["*"], path="/me/theme")
 async def set_my_theme(theme: str, identity=None) -> dict:
+    """`theme` is an open-ended preset NAME (e.g. "Late Night"), not a
+    fixed light/dark enum — admin's console owns the actual known set
+    (admin/ui/src/theme/presets.ts) and is meant to be extendable there
+    with no change needed here. This only enforces shape (matches
+    _users.theme's own STRING(60) column), never a specific value list —
+    same "DB/API tier enforces shape, app tier enforces meaning" split
+    psqldb's SELECT fields already use elsewhere."""
     identity = _require_identity(identity)
-    if theme not in ("light", "dark"):
-        arc.relay.throw("theme must be 'light' or 'dark'", code="invalid_theme")
+    theme = theme.strip()
+    if not theme or len(theme) > 60:
+        arc.relay.throw("theme must be a non-empty name, 60 characters or fewer", code="invalid_theme")
     await arc.relay.save("_users", {"id": identity.user_id, "theme": theme})
     return {"ok": True, "theme": theme}
 
