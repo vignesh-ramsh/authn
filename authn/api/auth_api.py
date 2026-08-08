@@ -24,6 +24,7 @@ from authn import (
     KEY_PREFIX_LEN,
     SUPERUSER_ROLE_NAME,
     PasswordPolicyError,
+    _ip_allowed,
     has_roles_subset,
     hash_token,
     utcnow,
@@ -117,24 +118,53 @@ def _cleared_session_response(content: dict):
     )
 
 
-@arc.relay.whitelist(methods=["POST"], roles=["Guest"], path="/login")
-async def login(
-    email: str | None = None,
-    username: str | None = None,
-    *,
-    password: str,
-    session_type: str = "Fixed",
-    client_ip: str | None = None,
+async def _active_sessions_summary(user_id: str) -> list[dict]:
+    """The caller's own currently-active sessions, shaped for a client to
+    render a "log one of these out" picker — used only when max_sessions
+    is what's blocking a login (login()'s own max_sessions_reached branch).
+    Never includes token_hash — nothing here is a credential, just enough
+    to tell sessions apart (docs/arc.MD §3.3's usual "return a curated
+    shape, never the raw row" rule)."""
+    rows = await arc.relay.list(
+        "_sessions",
+        filters={"user": user_id, "revoked_at": {"is_null": True}, "expires_at": {"gt": utcnow()}},
+        fields=["id", "session_type", "ip_address", "user_agent", "expires_at"],
+        limit=50,  # a generous backstop, not a real cap — max_sessions itself
+        # is always some small number in practice; this only exists so a
+        # pathological account somehow far past its own cap can't make this
+        # list unbounded.
+    )
+    return [
+        {
+            "id": str(r["id"]),
+            "session_type": r["session_type"],
+            "ip_address": r["ip_address"],
+            "user_agent": r["user_agent"],
+            "expires_at": r["expires_at"].isoformat() if r["expires_at"] else None,
+        }
+        for r in rows
+    ]
+
+
+async def _authenticate_credentials(
+    email: str | None, username: str | None, password: str, client_ip: str | None
 ) -> dict:
+    """The lookup/rate-limit/password/lockout gate login() and
+    terminate_login_session() both need, ahead of whatever each does
+    next — factored out once rather than duplicated: two independently-
+    maintained copies of security-sensitive verification logic is exactly
+    how they quietly drift apart (one path checks locked status, the other
+    forgets to). Returns the verified user row (every column,
+    arc.relay.all_columns) on success; raises the same generic
+    invalid_credentials RelayError either caller would raise anyway on any
+    failure — unknown identifier, wrong password, locked, or inactive."""
     from argon2 import PasswordHasher
     from argon2.exceptions import VerificationError, VerifyMismatchError
 
-    if session_type not in ("Fixed", "Extended"):
-        arc.relay.throw("session_type must be 'Fixed' or 'Extended'", code="bad_session_type")
     if not email and not username:
         arc.relay.throw("email or username is required", code="identifier_required")
 
-    # Two lookup fields, one login path — a real second capability (not
+    # Two lookup fields, one auth path — a real second capability (not
     # every "add a field" also means "and let it authenticate with"), added
     # because it was explicitly asked for. email stays the primary/default
     # identifier; username is a genuine alternative, not a fallback alias.
@@ -161,7 +191,7 @@ async def login(
         )
 
     # Internal use only — verified against, never returned directly
-    # (see _profile()'s own curated shape below, the only thing login()
+    # (see _profile()'s own curated shape below, the only thing a caller
     # ever hands back).
     user = await arc.relay.get("_users", lookup, arc.relay.all_columns("_users"))
 
@@ -226,6 +256,44 @@ async def login(
             "last_login_at": utcnow(),
         },
     )
+    return user
+
+
+def _check_allowed_source(user: dict, client_ip: str | None) -> None:
+    """Shared by login() and terminate_login_session() — a genuinely
+    correct password from a disallowed network. resolve_identity()'s own
+    _authorize() already enforces allowed_ips on every request AFTER a
+    session exists — the bug this closes is that neither pre-auth endpoint
+    checked it themselves, so a disallowed caller got a real, working
+    session cookie back (200, looks like success) that then failed on the
+    very next request it tried to use, with no explanation of why. A
+    distinct message here (unlike the generic invalid_credentials one) is
+    deliberate, not an oversight: it only ever fires post-correct-password,
+    so it can't be used to enumerate accounts the way a distinct
+    locked/inactive message would."""
+    if user["allowed_ips"] and not _ip_allowed(client_ip, user["allowed_ips"]):
+        arc.relay.throw(
+            "sign-in isn't allowed from this network — contact an administrator if this is unexpected",
+            status=403,
+            code="invalid_source",
+        )
+
+
+@arc.relay.whitelist(methods=["POST"], roles=["Guest"], path="/login")
+async def login(
+    email: str | None = None,
+    username: str | None = None,
+    *,
+    password: str,
+    session_type: str = "Fixed",
+    client_ip: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> dict:
+    if session_type not in ("Fixed", "Extended"):
+        arc.relay.throw("session_type must be 'Fixed' or 'Extended'", code="bad_session_type")
+
+    user = await _authenticate_credentials(email, username, password, client_ip)
+    _check_allowed_source(user, client_ip)
 
     # Count-then-insert is a race without this: two concurrent logins for
     # the same user could both see "under the cap" and both insert,
@@ -243,10 +311,18 @@ async def login(
             },
         )
         if user["max_sessions"] is not None and active_sessions >= user["max_sessions"]:
+            # extra.sessions rides along on the SAME error a plain client
+            # already handles (parseError's existing {error, code} path
+            # still works unchanged) — a client that knows to look for it
+            # can offer "log one of these out and retry" instead of a dead-
+            # end message; one that doesn't just shows the message as
+            # before. See RelayError.extra's own docstring for why this is
+            # a response field, not a second round trip.
             arc.relay.throw(
                 "maximum active sessions reached — log out an existing session first",
                 status=403,
                 code="max_sessions_reached",
+                extra={"sessions": await _active_sessions_summary(user["id"])},
             )
 
         token = secrets.token_urlsafe(32)
@@ -259,6 +335,8 @@ async def login(
                 "token_hash": hash_token(token),
                 "session_type": session_type,
                 "expires_at": expires_at,
+                "ip_address": client_ip,
+                "user_agent": (headers or {}).get("user-agent"),
             },
         )
     return _session_response(
@@ -266,6 +344,40 @@ async def login(
         token=token,
         ttl_seconds=ttl,
     )
+
+
+@arc.relay.whitelist(methods=["POST"], roles=["Guest"], path="/login/terminate-session")
+async def terminate_login_session(
+    session_id: str,
+    email: str | None = None,
+    username: str | None = None,
+    *,
+    password: str,
+    client_ip: str | None = None,
+) -> dict:
+    """Lets a caller who's hit max_sessions on /login pick one of their OWN
+    active sessions (the list login()'s max_sessions_reached error hands
+    back in extra.sessions) to revoke, then retry /login — the "you're
+    already signed in on N devices, log one out" flow.
+
+    Re-verifies email/password itself, through the exact same gate login()
+    uses — there's no session to trust for "who is this" here at all, the
+    caller isn't authenticated yet. Only ever revokes a session confirmed
+    to belong to THIS credential-verified user (the {"id":..., "user":...}
+    filter below, not id alone) — a session_id for someone else's session
+    is indistinguishable from one that doesn't exist, same non-enumeration
+    posture login() itself already takes on a bad identifier."""
+    user = await _authenticate_credentials(email, username, password, client_ip)
+    _check_allowed_source(user, client_ip)
+
+    session = await arc.relay.get(
+        "_sessions", {"id": session_id, "user": user["id"]}, ["id", "revoked_at"]
+    )
+    if session is None or session["revoked_at"] is not None:
+        arc.relay.throw("session not found", status=404, code="session_not_found")
+
+    await arc.relay.save("_sessions", {"id": session["id"], "revoked_at": utcnow()})
+    return {"ok": True}
 
 
 @arc.relay.whitelist(methods=["POST"], roles=["Guest"], path="/logout")
