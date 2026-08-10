@@ -700,7 +700,7 @@ def register(kernel: Any) -> None:
     kernel.settings.declare(PUBLIC_URL_KEY, doc="This instance's externally-reachable base URL.")
 
     psqldb = kernel.get("psqldb")
-    psqldb.register_model(Path(__file__).parent / "schemas")
+    psqldb.register_model(Path(__file__).parent.parent / "schemas")
 
     redix = kernel.get("redix") if kernel.has("redix") else None
     if redix is None:
@@ -725,5 +725,5 @@ def register(kernel: Any) -> None:
     )
 
     relay = kernel.get("relay")
-    relay.register_hooks(Path(__file__).parent / "hooks")
-    relay.register_api(Path(__file__).parent / "api")
+    relay.register_hooks(Path(__file__).parent.parent / "hooks")
+    relay.register_api(Path(__file__).parent.parent / "api")
