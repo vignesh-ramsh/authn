@@ -297,7 +297,9 @@ def set_password(email: str = typer.Option(..., "--email")) -> None:
             },
         )
         sessions = await arc.relay.list(
-            "_sessions", filters={"user": user["id"], "revoked_at": {"is_null": True}}
+            "_sessions",
+            fields=["id", "token_hash"],
+            filters={"user": user["id"], "revoked_at": {"is_null": True}},
         )
         for s in sessions:
             await arc.relay.save("_sessions", {"id": s["id"], "revoked_at": utcnow()})
