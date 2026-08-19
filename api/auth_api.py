@@ -1,6 +1,6 @@
 """authn's HTTP-reachable surface — explicit paths (relay.whitelist's
 path= override, docs/arc.MD §3.11) rather than the auto-derived
-/api/method/... convention, per the proposal this plugin was built from.
+/api/v1/... convention, per the proposal this plugin was built from.
 
 Known limitation, not an oversight: whitelisted functions receive only the
 JSON body as **kwargs (plus `identity`/`client_ip`, when the function's own
