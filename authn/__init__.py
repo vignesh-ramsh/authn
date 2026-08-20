@@ -38,7 +38,7 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -116,10 +116,6 @@ class Identity:
     email: str
     roles: list[str]
     auth_method: Literal["session", "api_key"]
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def hash_token(raw: str) -> str:
@@ -402,7 +398,7 @@ class AuthnProvider:
             return
         ttl_seconds = DEFAULT_ACCESS_KEY_CACHE_TTL_SECONDS
         if expires_at is not None:
-            ttl_seconds = max(0, min(int((expires_at - utcnow()).total_seconds()), ttl_seconds))
+            ttl_seconds = max(0, min(int((expires_at - arc.tz.utcnow()).total_seconds()), ttl_seconds))
         if ttl_seconds <= 0:
             return
         try:
@@ -486,7 +482,7 @@ class AuthnProvider:
         # failure here must never break authentication itself.
         try:
             await arc.relay.sql(
-                'UPDATE "_access_keys" SET last_used_at = $1 WHERE id = $2', utcnow(), access_key_id
+                'UPDATE "_access_keys" SET last_used_at = $1 WHERE id = $2', arc.tz.utcnow(), access_key_id
             )
         except Exception as exc:
             arc.relay.log(
@@ -546,7 +542,7 @@ class AuthnProvider:
         if (
             session is None
             or session["revoked_at"] is not None
-            or session["expires_at"] <= utcnow()
+            or session["expires_at"] <= arc.tz.utcnow()
         ):
             return None
 
@@ -565,7 +561,7 @@ class AuthnProvider:
             # see SUPERUSER_ROLE_NAME's docstring above.
             roles = [*roles, "*"]
         user_id = str(user["id"])
-        ttl_remaining = int((session["expires_at"] - utcnow()).total_seconds())
+        ttl_remaining = int((session["expires_at"] - arc.tz.utcnow()).total_seconds())
         await self._cache_set_session(
             token_hash,
             user_id=user_id,
@@ -612,7 +608,7 @@ class AuthnProvider:
         )
         if access_key is None or access_key["revoked_at"] is not None:
             return None
-        if access_key["expires_at"] is not None and access_key["expires_at"] <= utcnow():
+        if access_key["expires_at"] is not None and access_key["expires_at"] <= arc.tz.utcnow():
             return None
         if not hmac.compare_digest(hash_token(raw), access_key["key_hash"]):
             return None

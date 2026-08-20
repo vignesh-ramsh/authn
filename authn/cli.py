@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import contextlib
 import secrets
-from datetime import timedelta
 
 import arc
 import typer
@@ -39,7 +38,6 @@ from authn import (
     PasswordPolicyError,
     SUPERUSER_ROLE_NAME,
     hash_token,
-    utcnow,
     validate_password_strength,
 )
 
@@ -302,7 +300,7 @@ def set_password(email: str = typer.Option(..., "--email")) -> None:
             filters={"user": user["id"], "revoked_at": {"is_null": True}},
         )
         for s in sessions:
-            await arc.relay.save("_sessions", {"id": s["id"], "revoked_at": utcnow()})
+            await arc.relay.save("_sessions", {"id": s["id"], "revoked_at": arc.tz.utcnow()})
             await arc.authn.invalidate_session_cache(s["token_hash"])
         console.print(
             f"[bold green]{user['email']}: password updated, {len(sessions)} active session(s) revoked.[/bold green]"
@@ -471,7 +469,7 @@ def clear_sessions(
         _confirm_or_abort(yes)
 
         for s in sessions:
-            await arc.relay.save("_sessions", {"id": s["id"], "revoked_at": utcnow()})
+            await arc.relay.save("_sessions", {"id": s["id"], "revoked_at": arc.tz.utcnow()})
             await arc.authn.invalidate_session_cache(s["token_hash"])
         console.print(f"[bold green]revoked {len(sessions)} session(s).[/bold green]")
 
@@ -492,7 +490,7 @@ def prune_sessions(
     actually get cleaned up. Never touches a still-active session."""
 
     async def _do() -> None:
-        cutoff = utcnow() - timedelta(days=older_than_days)
+        cutoff = arc.tz.ago(days=older_than_days)
         rows = await arc.relay.sql(
             "SELECT id FROM _sessions WHERE (revoked_at IS NOT NULL AND revoked_at <= $1) OR (expires_at <= $1)",
             cutoff,
@@ -551,7 +549,7 @@ def browse_as(email: str = typer.Option(..., "--email")) -> None:
             {
                 "user": user["id"],
                 "token_hash": hash_token(raw_token),
-                "expires_at": utcnow() + timedelta(seconds=ttl_seconds),
+                "expires_at": arc.tz.add(seconds=ttl_seconds),
             },
         )
 
@@ -596,7 +594,7 @@ def prune_password_resets(
     dead rows accumulate as long."""
 
     async def _do() -> None:
-        cutoff = utcnow() - timedelta(days=older_than_days)
+        cutoff = arc.tz.ago(days=older_than_days)
         rows = await arc.relay.sql(
             "SELECT id FROM _password_resets WHERE (used_at IS NOT NULL AND used_at <= $1) OR (expires_at <= $1)",
             cutoff,
@@ -669,7 +667,7 @@ def clear_access_key(
         _confirm_or_abort(yes)
 
         for k in keys:
-            await arc.relay.save("_access_keys", {"id": k["id"], "revoked_at": utcnow()})
+            await arc.relay.save("_access_keys", {"id": k["id"], "revoked_at": arc.tz.utcnow()})
             await arc.authn.invalidate_access_key_cache(k["key_prefix"])
         console.print(f"[bold green]revoked {len(keys)} access key(s).[/bold green]")
 
@@ -687,7 +685,7 @@ def prune_access_keys(
     pruned, by construction — only revoked-or-expired-and-old rows qualify."""
 
     async def _do() -> None:
-        cutoff = utcnow() - timedelta(days=older_than_days)
+        cutoff = arc.tz.ago(days=older_than_days)
         rows = await arc.relay.sql(
             "SELECT id FROM _access_keys WHERE (revoked_at IS NOT NULL AND revoked_at <= $1) "
             "OR (expires_at IS NOT NULL AND expires_at <= $1)",

@@ -15,7 +15,6 @@ built yet", not a new one.
 import asyncio
 import json
 import secrets
-from datetime import timedelta
 from typing import Any
 
 import arc
@@ -27,7 +26,6 @@ from authn import (
     _ip_allowed,
     has_roles_subset,
     hash_token,
-    utcnow,
     validate_password_strength,
 )
 
@@ -127,7 +125,7 @@ async def _active_sessions_summary(user_id: str) -> list[dict]:
     shape, never the raw row" rule)."""
     rows = await arc.relay.list(
         "_sessions",
-        filters={"user": user_id, "revoked_at": {"is_null": True}, "expires_at": {"gt": utcnow()}},
+        filters={"user": user_id, "revoked_at": {"is_null": True}, "expires_at": {"gt": arc.tz.utcnow()}},
         fields=["id", "session_type", "ip_address", "user_agent", "expires_at"],
         limit=50,  # a generous backstop, not a real cap — max_sessions itself
         # is always some small number in practice; this only exists so a
@@ -220,13 +218,13 @@ async def _authenticate_credentials(
     # expiry immediately re-locks the account (1-strike-relock, docs
     # review-2026-07-14.md L2), and failed_login_count grows without bound across
     # repeated lockouts instead of resetting to a fresh N-attempt budget.
-    if user["locked_until"] is not None and user["locked_until"] <= utcnow():
+    if user["locked_until"] is not None and user["locked_until"] <= arc.tz.utcnow():
         await arc.relay.save(
             "_users", {"id": user["id"], "failed_login_count": 0, "locked_until": None}
         )
         user = {**user, "failed_login_count": 0, "locked_until": None}
 
-    locked = user["locked_until"] is not None and user["locked_until"] > utcnow()
+    locked = user["locked_until"] is not None and user["locked_until"] > arc.tz.utcnow()
     inactive = user["status"] != "Active"
 
     if locked or inactive or not password_ok:
@@ -238,7 +236,7 @@ async def _authenticate_credentials(
             new_count = (user["failed_login_count"] or 0) + 1
             update = {"id": user["id"], "failed_login_count": new_count}
             if new_count >= arc.authn.lockout_threshold():
-                update["locked_until"] = utcnow() + timedelta(seconds=arc.authn.lockout_seconds())
+                update["locked_until"] = arc.tz.add(seconds=arc.authn.lockout_seconds())
             await arc.relay.save("_users", update)
         # One generic message regardless of WHY this failed (unknown email,
         # wrong password, locked, inactive) — a distinct message per case
@@ -253,7 +251,7 @@ async def _authenticate_credentials(
             "id": user["id"],
             "failed_login_count": 0,
             "locked_until": None,
-            "last_login_at": utcnow(),
+            "last_login_at": arc.tz.utcnow(),
         },
     )
     return user
@@ -307,7 +305,7 @@ async def login(
             filters={
                 "user": user["id"],
                 "revoked_at": {"is_null": True},
-                "expires_at": {"gt": utcnow()},
+                "expires_at": {"gt": arc.tz.utcnow()},
             },
         )
         if user["max_sessions"] is not None and active_sessions >= user["max_sessions"]:
@@ -327,7 +325,7 @@ async def login(
 
         token = secrets.token_urlsafe(32)
         ttl = arc.authn.session_ttl_seconds(session_type)
-        expires_at = utcnow() + timedelta(seconds=ttl)
+        expires_at = arc.tz.add(seconds=ttl)
         await arc.relay.save(
             "_sessions",
             {
@@ -376,7 +374,7 @@ async def terminate_login_session(
     if session is None or session["revoked_at"] is not None:
         arc.relay.throw("session not found", status=404, code="session_not_found")
 
-    await arc.relay.save("_sessions", {"id": session["id"], "revoked_at": utcnow()})
+    await arc.relay.save("_sessions", {"id": session["id"], "revoked_at": arc.tz.utcnow()})
     return {"ok": True}
 
 
@@ -389,7 +387,7 @@ async def logout(cookies: dict[str, str] | None = None) -> dict:
             "_sessions", {"token_hash": token_hash}, ["id", "revoked_at"]
         )
         if session is not None and session["revoked_at"] is None:
-            await arc.relay.save("_sessions", {"id": session["id"], "revoked_at": utcnow()})
+            await arc.relay.save("_sessions", {"id": session["id"], "revoked_at": arc.tz.utcnow()})
             await arc.authn.invalidate_session_cache(token_hash)
     return _cleared_session_response({"ok": True})
 
@@ -489,7 +487,7 @@ async def impersonate_consume(ticket: str) -> Any:
         {"token_hash": ticket_hash},
         ["id", "used_at", "expires_at", "user"],
     )
-    if row is None or row["used_at"] is not None or row["expires_at"] <= utcnow():
+    if row is None or row["used_at"] is not None or row["expires_at"] <= arc.tz.utcnow():
         arc.relay.throw("invalid or expired impersonation link", status=400, code="invalid_ticket")
 
     user = await arc.relay.get("_users", row["user"], ["id", "status"])
@@ -499,11 +497,11 @@ async def impersonate_consume(ticket: str) -> Any:
     # Marked used BEFORE the session is created — a ticket is single-use
     # regardless of whether session creation below succeeds; a failure
     # partway through must never leave a still-consumable ticket behind.
-    await arc.relay.save("_impersonation_tickets", {"id": row["id"], "used_at": utcnow()})
+    await arc.relay.save("_impersonation_tickets", {"id": row["id"], "used_at": arc.tz.utcnow()})
 
     token = secrets.token_urlsafe(32)
     ttl = arc.authn.session_ttl_seconds("Fixed")
-    expires_at = utcnow() + timedelta(seconds=ttl)
+    expires_at = arc.tz.add(seconds=ttl)
     await arc.relay.save(
         "_sessions",
         {
@@ -569,7 +567,7 @@ async def forgot_password(email: str, client_ip: str | None = None) -> dict:
         {
             "user": user["id"],
             "token_hash": hash_token(raw_token),
-            "expires_at": utcnow() + timedelta(seconds=ttl_seconds),
+            "expires_at": arc.tz.add(seconds=ttl_seconds),
         },
     )
 
@@ -616,7 +614,7 @@ async def reset_password(token: str, new_password: str, client_ip: str | None = 
         {"token_hash": hash_token(token)},
         ["id", "used_at", "expires_at", "user"],
     )
-    if reset is None or reset["used_at"] is not None or reset["expires_at"] <= utcnow():
+    if reset is None or reset["used_at"] is not None or reset["expires_at"] <= arc.tz.utcnow():
         arc.relay.throw("invalid or expired reset link", status=400, code="invalid_reset_token")
 
     user = await arc.relay.get("_users", reset["user"], ["id", "email"])
@@ -647,7 +645,7 @@ async def reset_password(token: str, new_password: str, client_ip: str | None = 
             "locked_until": None,
         },
     )
-    await arc.relay.save("_password_resets", {"id": reset["id"], "used_at": utcnow()})
+    await arc.relay.save("_password_resets", {"id": reset["id"], "used_at": arc.tz.utcnow()})
 
     # Sessions only — access keys deliberately left alone: a leaked
     # password compromises interactive sessions, not a separately-issued
@@ -662,7 +660,7 @@ async def reset_password(token: str, new_password: str, client_ip: str | None = 
         filters={"user": user["id"], "revoked_at": {"is_null": True}},
     )
     for s in sessions:
-        await arc.relay.save("_sessions", {"id": s["id"], "revoked_at": utcnow()})
+        await arc.relay.save("_sessions", {"id": s["id"], "revoked_at": arc.tz.utcnow()})
         await arc.authn.invalidate_session_cache(s["token_hash"])
 
     return {"ok": True}
@@ -679,7 +677,7 @@ async def refresh(cookies: dict[str, str] | None = None) -> dict:
         {"token_hash": token_hash},
         ["id", "revoked_at", "expires_at", "user", "session_type"],
     )
-    if session is None or session["revoked_at"] is not None or session["expires_at"] <= utcnow():
+    if session is None or session["revoked_at"] is not None or session["expires_at"] <= arc.tz.utcnow():
         arc.relay.throw("invalid or expired session", status=401, code="invalid_session")
 
     # The user must still be Active to keep the chain alive — without this,
@@ -693,12 +691,12 @@ async def refresh(cookies: dict[str, str] | None = None) -> dict:
 
     # Rotate rather than extend in place — _sessions stays an honest log of
     # distinct sessions, and a stolen old token stops working immediately.
-    await arc.relay.save("_sessions", {"id": session["id"], "revoked_at": utcnow()})
+    await arc.relay.save("_sessions", {"id": session["id"], "revoked_at": arc.tz.utcnow()})
     await arc.authn.invalidate_session_cache(token_hash)
 
     new_token = secrets.token_urlsafe(32)
     ttl = arc.authn.session_ttl_seconds(session["session_type"])
-    expires_at = utcnow() + timedelta(seconds=ttl)
+    expires_at = arc.tz.add(seconds=ttl)
     await arc.relay.save(
         "_sessions",
         {
@@ -749,7 +747,7 @@ async def revoke_access_key(key_id: str, identity=None) -> dict:
     row = await arc.relay.get("_access_keys", key_id, ["user", "key_prefix"])
     if row is None or str(row["user"]) != identity.user_id:
         arc.relay.throw("no such access key", status=404, code="not_found")
-    await arc.relay.save("_access_keys", {"id": key_id, "revoked_at": utcnow()})
+    await arc.relay.save("_access_keys", {"id": key_id, "revoked_at": arc.tz.utcnow()})
     await arc.authn.invalidate_access_key_cache(row["key_prefix"])
     return {"ok": True}
 
@@ -781,6 +779,6 @@ async def revoke_session(session_id: str, identity=None) -> dict:
     row = await arc.relay.get("_sessions", session_id, ["user", "token_hash"])
     if row is None or str(row["user"]) != identity.user_id:
         arc.relay.throw("no such session", status=404, code="not_found")
-    await arc.relay.save("_sessions", {"id": session_id, "revoked_at": utcnow()})
+    await arc.relay.save("_sessions", {"id": session_id, "revoked_at": arc.tz.utcnow()})
     await arc.authn.invalidate_session_cache(row["token_hash"])
     return {"ok": True}
