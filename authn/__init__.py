@@ -31,8 +31,6 @@ after_save hook, which is what keeps it honest.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import ipaddress
 import logging
 import secrets
@@ -116,10 +114,6 @@ class Identity:
     email: str
     roles: list[str]
     auth_method: Literal["session", "api_key"]
-
-
-def hash_token(raw: str) -> str:
-    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def _get_header(scope: dict, name: bytes) -> bytes | None:
@@ -521,7 +515,7 @@ class AuthnProvider:
         token = token.strip()
         if not token:
             return None
-        token_hash = hash_token(token)
+        token_hash = arc.hash(token)
 
         cached = await self._cache_get_session(token_hash)
         if cached is not None:
@@ -584,7 +578,7 @@ class AuthnProvider:
 
         cached = await self._cache_get_access_key(prefix)
         if cached is not None:
-            if not hmac.compare_digest(hash_token(raw), cached["key_hash"]):
+            if not arc.verify_hash(arc.hash(raw), cached["key_hash"]):
                 # Prefix matched a cache entry but the secret doesn't — a
                 # definitively invalid key, no need to fall through to the DB.
                 return None
@@ -610,7 +604,7 @@ class AuthnProvider:
             return None
         if access_key["expires_at"] is not None and access_key["expires_at"] <= arc.tz.utcnow():
             return None
-        if not hmac.compare_digest(hash_token(raw), access_key["key_hash"]):
+        if not arc.verify_hash(arc.hash(raw), access_key["key_hash"]):
             return None
 
         user = await arc.relay.get(

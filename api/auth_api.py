@@ -25,7 +25,6 @@ from authn import (
     PasswordPolicyError,
     _ip_allowed,
     has_roles_subset,
-    hash_token,
     validate_password_strength,
 )
 
@@ -330,7 +329,7 @@ async def login(
             "_sessions",
             {
                 "user": user["id"],
-                "token_hash": hash_token(token),
+                "token_hash": arc.hash(token),
                 "session_type": session_type,
                 "expires_at": expires_at,
                 "ip_address": client_ip,
@@ -382,7 +381,7 @@ async def terminate_login_session(
 async def logout(cookies: dict[str, str] | None = None) -> dict:
     token = (cookies or {}).get("arc_session")
     if token:
-        token_hash = hash_token(token)
+        token_hash = arc.hash(token)
         session = await arc.relay.get(
             "_sessions", {"token_hash": token_hash}, ["id", "revoked_at"]
         )
@@ -481,7 +480,7 @@ async def impersonate_consume(ticket: str) -> Any:
     against another account's session budget, not a login on that user's
     own behalf, and shouldn't be blocked by however many sessions that
     user already has open elsewhere."""
-    ticket_hash = hash_token(ticket)
+    ticket_hash = arc.hash(ticket)
     row = await arc.relay.get(
         "_impersonation_tickets",
         {"token_hash": ticket_hash},
@@ -506,7 +505,7 @@ async def impersonate_consume(ticket: str) -> Any:
         "_sessions",
         {
             "user": user["id"],
-            "token_hash": hash_token(token),
+            "token_hash": arc.hash(token),
             "session_type": "Fixed",
             "expires_at": expires_at,
         },
@@ -566,7 +565,7 @@ async def forgot_password(email: str, client_ip: str | None = None) -> dict:
         "_password_resets",
         {
             "user": user["id"],
-            "token_hash": hash_token(raw_token),
+            "token_hash": arc.hash(raw_token),
             "expires_at": arc.tz.add(seconds=ttl_seconds),
         },
     )
@@ -611,7 +610,7 @@ async def reset_password(token: str, new_password: str, client_ip: str | None = 
 
     reset = await arc.relay.get(
         "_password_resets",
-        {"token_hash": hash_token(token)},
+        {"token_hash": arc.hash(token)},
         ["id", "used_at", "expires_at", "user"],
     )
     if reset is None or reset["used_at"] is not None or reset["expires_at"] <= arc.tz.utcnow():
@@ -671,7 +670,7 @@ async def refresh(cookies: dict[str, str] | None = None) -> dict:
     token = (cookies or {}).get("arc_session")
     if not token:
         arc.relay.throw("invalid or expired session", status=401, code="invalid_session")
-    token_hash = hash_token(token)
+    token_hash = arc.hash(token)
     session = await arc.relay.get(
         "_sessions",
         {"token_hash": token_hash},
@@ -701,7 +700,7 @@ async def refresh(cookies: dict[str, str] | None = None) -> dict:
         "_sessions",
         {
             "user": session["user"],
-            "token_hash": hash_token(new_token),
+            "token_hash": arc.hash(new_token),
             "session_type": session["session_type"],
             "expires_at": expires_at,
         },
@@ -733,7 +732,7 @@ async def create_access_key(label: str, scopes: list[str], identity=None) -> dic
         {
             "user": identity.user_id,
             "key_prefix": prefix,
-            "key_hash": hash_token(raw_key),
+            "key_hash": arc.hash(raw_key),
             "label": label,
             "scopes": scopes,
         },

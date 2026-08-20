@@ -37,7 +37,6 @@ from psqldb.validation import ValidationError
 from authn import (
     PasswordPolicyError,
     SUPERUSER_ROLE_NAME,
-    hash_token,
     validate_password_strength,
 )
 
@@ -548,7 +547,7 @@ def browse_as(email: str = typer.Option(..., "--email")) -> None:
             "_impersonation_tickets",
             {
                 "user": user["id"],
-                "token_hash": hash_token(raw_token),
+                "token_hash": arc.hash(raw_token),
                 "expires_at": arc.tz.add(seconds=ttl_seconds),
             },
         )
