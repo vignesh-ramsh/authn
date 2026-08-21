@@ -67,8 +67,14 @@ def _cookie_secure() -> bool:
     """A Secure cookie is silently refused by the browser entirely over
     plain HTTP — `arc run` without a reverse proxy in front serves plain
     HTTP by default, so this has to follow whatever gateway_force_https is
-    actually set to, not just default on and quietly break local dev."""
-    return (arc.settings.get("gateway_force_https") or "").lower() in ("1", "true", "yes")
+    actually set to, not just default on and quietly break local dev.
+
+    gateway.register() declares this key `type=bool`, so settings.get()
+    already returns a real bool — no string parsing needed. (A bool has
+    no .lower(), so the old `(... or "").lower() in (...)` shape crashed
+    with an AttributeError the instant the setting was actually True —
+    the one config that matters for a production TLS deployment.)"""
+    return bool(arc.settings.get("gateway_force_https"))
 
 
 def _session_response(content: dict, *, token: str, ttl_seconds: int):
