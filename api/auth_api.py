@@ -374,12 +374,18 @@ async def terminate_login_session(
     _check_allowed_source(user, client_ip)
 
     session = await arc.relay.get(
-        "_sessions", {"id": session_id, "user": user["id"]}, ["id", "revoked_at"]
+        "_sessions", {"id": session_id, "user": user["id"]}, ["id", "revoked_at", "token_hash"]
     )
     if session is None or session["revoked_at"] is not None:
         arc.relay.throw("session not found", status=404, code="session_not_found")
 
     await arc.relay.save("_sessions", {"id": session["id"], "revoked_at": arc.tz.utcnow()})
+    # Every other revoke path (logout/revoke_session/refresh/
+    # reset_password) pairs the write with this — without it, a cached
+    # session (redix installed) stays fully authenticated until its cache
+    # entry's TTL expires (up to authn_extended_session_ttl_days), since
+    # _resolve_session's cache hit never re-reads revoked_at at all.
+    await arc.authn.invalidate_session_cache(session["token_hash"])
     return {"ok": True}
 
 
