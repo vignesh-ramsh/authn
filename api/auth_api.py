@@ -13,7 +13,6 @@ built yet", not a new one.
 """
 
 import asyncio
-import json
 import secrets
 from typing import Any
 
@@ -438,49 +437,56 @@ async def set_my_theme(theme: str, identity=None) -> dict:
     return {"ok": True, "theme": theme}
 
 
-def _impersonate_html(ticket: str) -> str:
-    """A tiny, self-submitting shell page — no external resources, so it
-    works standalone with no build step. `ticket_json` is a properly
-    JSON-escaped JS string literal (json.dumps), with `</` additionally
-    neutralized so a ticket value can never prematurely close the
-    surrounding <script> tag — `ticket` arrives straight from the query
-    string, i.e. is attacker-controlled input being embedded into HTML."""
-    ticket_json = json.dumps(ticket).replace("</", "<\\/")
-    return (
-        '<!doctype html><html><head><meta charset="utf-8">'
-        "<title>Signing in…</title></head><body>"
-        "<p>Signing you in…</p>"
-        "<script>"
-        # A stray, leftover arc_session cookie from some earlier/unrelated
-        # session (this browser doesn't have to be "fresh") makes
-        # gateway's csrf_middleware demand a matching X-CSRF-Token the
-        # instant one's present — same double-submit rule client.ts's own
-        # headers() helper already follows for every mutating call, echoed
-        # here by hand since this page has no bundle to share it from.
-        "var m=document.cookie.match(/(?:^|;\\s*)csrf_token=([^;]+)/);"
-        "var h={'Content-Type':'application/json'};"
-        "if(m)h['X-CSRF-Token']=decodeURIComponent(m[1]);"
-        "fetch('/impersonate/consume',{method:'POST',credentials:'same-origin',headers:h,"
-        "body:JSON.stringify({ticket:" + ticket_json + "})})"
-        ".then(function(res){if(!res.ok)throw new Error('invalid');window.location.replace('/');})"
-        ".catch(function(){document.body.textContent="
-        "'This impersonation link is invalid or has expired.';});"
-        "</script></body></html>"
-    )
+_IMPERSONATE_HTML = (
+    '<!doctype html><html><head><meta charset="utf-8">'
+    "<title>Signing in…</title></head><body>"
+    "<p>Signing you in…</p>"
+    '<script src="/impersonate.js"></script>'
+    "</body></html>"
+)
+
+_IMPERSONATE_JS = (
+    # Reads `ticket` straight off the URL itself — never server-embedded —
+    # so this stays a genuinely static, same-origin script (a CSP
+    # script-src with no 'unsafe-inline'/nonce still allows it, unlike the
+    # inline <script> this replaces) and there's no HTML/JS-escaping of
+    # attacker-controlled input left to get right on the server side;
+    # JSON.stringify below does that safely on the client instead.
+    "var ticket=new URLSearchParams(window.location.search).get('ticket');"
+    # A stray, leftover arc_session cookie from some earlier/unrelated
+    # session (this browser doesn't have to be "fresh") makes
+    # gateway's csrf_middleware demand a matching X-CSRF-Token the
+    # instant one's present — same double-submit rule client.ts's own
+    # headers() helper already follows for every mutating call, echoed
+    # here by hand since this page has no bundle to share it from.
+    "var m=document.cookie.match(/(?:^|;\\s*)csrf_token=([^;]+)/);"
+    "var h={'Content-Type':'application/json'};"
+    "if(m)h['X-CSRF-Token']=decodeURIComponent(m[1]);"
+    "fetch('/impersonate/consume',{method:'POST',credentials:'same-origin',headers:h,"
+    "body:JSON.stringify({ticket:ticket})})"
+    ".then(function(res){if(!res.ok)throw new Error('invalid');window.location.replace('/');})"
+    ".catch(function(){document.body.textContent="
+    "'This impersonation link is invalid or has expired.';});"
+)
 
 
 @arc.relay.whitelist(methods=["GET"], roles=["Guest"], path="/impersonate")
 async def impersonate(ticket: str) -> Any:
     """Serves the self-submitting shell above — reached by a plain browser
     navigation (the CLI opens this URL directly, and a browser can only
-    ever GET a typed/clicked link). Deliberately does NO writes itself:
-    relay treats every GET as dry-run for arc.relay.save/delete calls
+    ever GET a typed/clicked link). `ticket` is required here only to keep
+    this route's contract (arc authn browse-as builds exactly this URL
+    shape) and fail fast on a malformed link; the shell page itself never
+    embeds it anywhere — impersonate.js below reads it straight off the
+    URL client-side, so this handler's own response never touches
+    attacker-controlled input. Deliberately does NO writes itself: relay
+    treats every GET as dry-run for arc.relay.save/delete calls
     (_wire_gateway_route's own safety net, see relay/__init__.py) — an
     earlier version of this endpoint tried to consume the ticket and
     create the session directly here, and relay silently rolled both
     writes back, leaving a Set-Cookie pointing at a session that was
-    never actually persisted. The real work happens from this page's own
-    POST to /impersonate/consume below, which is a genuine, non-dry-run
+    never actually persisted. The real work happens from impersonate.js's
+    own POST to /impersonate/consume below, which is a genuine, non-dry-run
     write."""
     if not hasattr(arc, "gateway"):
         arc.relay.throw(
@@ -488,7 +494,23 @@ async def impersonate(ticket: str) -> Any:
         )
     from gateway.request import Response
 
-    return Response(content=_impersonate_html(ticket), media_type="text/html")
+    return Response(content=_IMPERSONATE_HTML, media_type="text/html")
+
+
+@arc.relay.whitelist(methods=["GET"], roles=["Guest"], path="/impersonate.js")
+async def impersonate_js() -> Any:
+    """The static script impersonate()'s shell page loads — same-origin,
+    so a strict CSP script-src still allows it with no 'unsafe-inline' or
+    nonce. Fixed content, no per-request templating: nothing here is
+    caller-controlled, so this could just as well be served from a CDN or
+    static host with zero behavior change if this app ever grows one."""
+    if not hasattr(arc, "gateway"):
+        arc.relay.throw(
+            "this endpoint requires the gateway plugin", status=501, code="not_implemented"
+        )
+    from gateway.request import Response
+
+    return Response(content=_IMPERSONATE_JS, media_type="text/javascript")
 
 
 @arc.relay.whitelist(methods=["POST"], roles=["Guest"], path="/impersonate/consume")
