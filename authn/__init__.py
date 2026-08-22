@@ -31,6 +31,8 @@ after_save hook, which is what keeps it honest.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import ipaddress
 import logging
 import secrets
@@ -69,6 +71,16 @@ IMPERSONATION_TICKET_TTL_SECONDS_KEY = "authn_impersonation_ticket_ttl_seconds"
 # value the same as "mail isn't configured" — a clean, friendly refusal
 # rather than emailing a broken link.
 PUBLIC_URL_KEY = "authn_public_url"
+# Auto-generated at boot (same _ensure_signing_secret-shaped flow filer's
+# own filer_signing_secret uses — see this module's own
+# _ensure_csrf_secret) — the HMAC key sign_csrf_token()/verify_csrf_token()
+# derive a session-bound CSRF token from. Never exposed outside this
+# module; a plain double-submit random value (the old shape) is forgeable
+# by anyone who can merely WRITE a cookie for this origin (a sibling-
+# subdomain XSS, a cookie-injection bug elsewhere) without ever reading
+# the real one — binding the token to the session via a server-only
+# secret closes that.
+CSRF_SECRET_KEY = "authn_csrf_secret"
 
 DEFAULT_SESSION_TTL_HOURS = 12
 DEFAULT_EXTENDED_SESSION_TTL_DAYS = 30
@@ -268,6 +280,62 @@ class AuthnProvider:
         route; this setting's VALUE is where that knowledge has to live
         instead, set once by whoever configures the instance."""
         return self._kernel.settings.get(PUBLIC_URL_KEY)
+
+    # ------------------------------------------------------------------ #
+    # CSRF — a signed double-submit token, not a bare random value. The
+    # gateway-side check (gateway.middleware.csrf_middleware) reaches
+    # this via kernel.get("authn"), the identical lazy, duck-typed,
+    # per-request lookup identity_middleware already uses — gateway
+    # never imports authn's own module, only calls whatever object
+    # kernel.has("authn")/kernel.get("authn") hands it.
+    # ------------------------------------------------------------------ #
+    def sign_csrf_token(self, session_token: str) -> str:
+        """The value minted into the JS-readable `csrf_token` cookie
+        alongside a session — HMAC-SHA256 of the (unhashed) session
+        token, keyed by this instance's own authn_csrf_secret, instead
+        of the old `secrets.token_urlsafe(16)` (a value with no
+        relationship to the session it rode alongside at all).
+
+        Binding it to the session is what closes the actual gap: a
+        PLAIN double-submit cookie is only as strong as "attacker can't
+        read a cookie for this origin," but an attacker doesn't need to
+        READ the real csrf_token to defeat it — writing ANY value as
+        both the cookie and a matching header already passes the old
+        check. Writing a cookie for an origin is a materially weaker bar
+        than reading one (a sibling-subdomain XSS, or a cookie-injection
+        bug elsewhere, can often set a cookie without being able to read
+        this origin's own). Recomputing the expected value HERE, from
+        the session token gateway already has (the arc_session cookie
+        itself — HttpOnly, and meaningless unless it matches a real
+        `_sessions.token_hash` row) and a secret the attacker never has,
+        means merely writing a chosen cookie value buys nothing: the
+        verifier never trusts the cookie's own content as the thing
+        being checked, only as A value to independently recompute and
+        compare against."""
+        key = self._csrf_secret()
+        return hmac.new(key, session_token.encode(), hashlib.sha256).hexdigest()
+
+    def verify_csrf_token(self, session_token: str, candidate: str) -> bool:
+        """True if `candidate` (the X-CSRF-Token header) is exactly what
+        sign_csrf_token(session_token) would produce right now — used by
+        gateway.middleware.csrf_middleware instead of comparing the
+        header against the csrf_token COOKIE's own value (see
+        sign_csrf_token's own docstring for why that comparison was the
+        actual weakness)."""
+        if not session_token or not candidate:
+            return False
+        expected = self.sign_csrf_token(session_token)
+        return hmac.compare_digest(expected, candidate)
+
+    def _csrf_secret(self) -> bytes:
+        value = self._kernel.settings.get(CSRF_SECRET_KEY, reveal=True)
+        if not value:
+            raise RuntimeError(
+                f"'{CSRF_SECRET_KEY}' is unset — authn.register() should have "
+                f"generated it at boot; was this AuthnProvider constructed without "
+                f"going through arc.boot()?"
+            )
+        return value.encode()
 
     # ------------------------------------------------------------------ #
     # Rate limiting — redix-backed when present, in-process fallback
@@ -641,6 +709,31 @@ class AuthnProvider:
         )
 
 
+def _ensure_csrf_secret(kernel: Any) -> None:
+    """Generates authn_csrf_secret ONCE, here at boot — same shape and
+    same reasoning as filer's own _ensure_signing_secret (filer/
+    filer/__init__.py): a lazy check-then-generate-then-save on the
+    request path would race across every worker PROCESS on a fresh
+    install, each missing, generating a DIFFERENT secret, and each
+    overwriting the last — every csrf_token an earlier-writing worker
+    already minted would stop verifying, indistinguishable from a
+    genuine forgery. flock()'d on a dedicated lock file for the same
+    cross-process-at-once-boot reason filer's copy is."""
+    if kernel.settings.get(CSRF_SECRET_KEY, reveal=True):
+        return
+
+    import fcntl
+
+    lock_path = kernel.settings.arc_dir / "authn_csrf_secret.lock"
+    with open(lock_path, "a+") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            if not kernel.settings.get(CSRF_SECRET_KEY, reveal=True):
+                kernel.settings.set(CSRF_SECRET_KEY, secrets.token_urlsafe(32), secret=True)
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 def register(kernel: Any) -> None:
     # Typed declare (§1 P0) — get() below returns a real int, defaulted,
     # and a hand-edited non-numeric value fails at arc.boot() rather than
@@ -688,6 +781,10 @@ def register(kernel: Any) -> None:
         doc="Impersonation ticket TTL, in seconds.",
     )
     kernel.settings.declare(PUBLIC_URL_KEY, doc="This instance's externally-reachable base URL.")
+    kernel.settings.declare(
+        CSRF_SECRET_KEY, secret=True, doc="Auto-generated at boot if unset."
+    )
+    _ensure_csrf_secret(kernel)
 
     psqldb = kernel.get("psqldb")
     psqldb.register_model(Path(__file__).parent.parent / "schemas")

@@ -96,8 +96,15 @@ def _session_response(content: dict, *, token: str, ttl_seconds: int):
         cookies=[
             Cookie("arc_session", token, max_age=ttl_seconds, http_only=True, secure=secure),
             Cookie(
+                # HMAC-SHA256 of the session token (arc.authn.
+                # sign_csrf_token), not a bare random value — see that
+                # method's own docstring for why binding it to the
+                # session is what actually closes the CSRF gap, rather
+                # than a plain double-submit value an attacker who can
+                # merely WRITE a cookie for this origin (never having to
+                # READ the real one) could already forge.
                 "csrf_token",
-                secrets.token_urlsafe(16),
+                arc.authn.sign_csrf_token(token),
                 max_age=ttl_seconds,
                 http_only=False,
                 secure=secure,
