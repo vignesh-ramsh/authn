@@ -29,10 +29,10 @@ from rich.table import Table
 # takes on psqldb's internals ("the only dependency Relay takes on
 # psqldb's internals") — ValidationError is only re-exported at
 # psqldb's own MODULE level (psqldb/__init__.py), not attached to the
-# arc.psqldb capability INSTANCE the way relay.RelayError deliberately is
-# (docs/arc.MD §3.11), so there's no `arc.psqldb.ValidationError` to catch
+# arc.pgdb capability INSTANCE the way relay.RelayError deliberately is
+# (docs/arc.MD §3.11), so there's no `arc.pgdb.ValidationError` to catch
 # without this.
-from psqldb.validation import ValidationError
+from pgdb.validation import ValidationError
 
 from authn import (
     PasswordPolicyError,
@@ -53,7 +53,7 @@ def _run(coro) -> None:
     # dance this used to hand-roll — redix is opened only when installed,
     # same as the old `hasattr(arc, "redix")` check, since run_async skips
     # any capability name that isn't actually registered this boot.
-    arc.runtime.run_async(coro, open=("psqldb", "redix"))
+    arc.runtime.run_async(coro, open=("pgdb", "redix"))
 
 
 @contextlib.contextmanager

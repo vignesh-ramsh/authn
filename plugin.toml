@@ -2,5 +2,5 @@
 name = "authn"
 version = "0.1.0"
 capability = "authn"
-requires = ["psqldb", "relay"]
+requires = ["pgdb", "relay"]
 optional_requires = ["redix", "gateway", "mail"]

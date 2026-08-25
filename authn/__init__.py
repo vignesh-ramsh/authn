@@ -786,7 +786,7 @@ def register(kernel: Any) -> None:
     )
     _ensure_csrf_secret(kernel)
 
-    psqldb = kernel.get("psqldb")
+    psqldb = kernel.get("pgdb")
     psqldb.register_model(Path(__file__).parent.parent / "schemas")
 
     redix = kernel.get("redix") if kernel.has("redix") else None
@@ -807,7 +807,7 @@ def register(kernel: Any) -> None:
     kernel.export(
         CAPABILITY,
         provider,
-        requires=["psqldb", "relay"],
+        requires=["pgdb", "relay"],
         optional_requires=["redix", "gateway", "mail"],
     )
 
