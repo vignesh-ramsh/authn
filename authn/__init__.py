@@ -7,7 +7,7 @@ key management surface is whitelisted HTTP, not this capability's own
 methods — see authn/api/auth_api.py.
 
 Backed by four "system": true tables (self-declared, no soft-delete — a
-hard DELETE instead, psqldb.soft_delete's own docstring — not patchable by
+hard DELETE instead, pgdb.soft_delete's own docstring — not patchable by
 other plugins, a deliberate tradeoff, see authn/schemas/): _users, _roles,
 _sessions, _access_keys.
 
@@ -786,8 +786,8 @@ def register(kernel: Any) -> None:
     )
     _ensure_csrf_secret(kernel)
 
-    psqldb = kernel.get("pgdb")
-    psqldb.register_model(Path(__file__).parent.parent / "schemas")
+    pgdb = kernel.get("pgdb")
+    pgdb.register_model(Path(__file__).parent.parent / "schemas")
 
     redix = kernel.get("redix") if kernel.has("redix") else None
     if redix is None:

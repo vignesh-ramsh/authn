@@ -1,16 +1,16 @@
 """authn.cli — `arc authn ...` commands.
 
 Mounted onto the core `arc` CLI via the `arc.plugins.cli` entry point (see
-arc.plugin_cli in the kernel), same mechanism as psqldb.cli/redix.cli/
+arc.plugin_cli in the kernel), same mechanism as pgdb.cli/redix.cli/
 gateway.cli.
 
-Unlike psqldb/redix's connectivity commands (status/connect, a lightweight
+Unlike pgdb/redix's connectivity commands (status/connect, a lightweight
 DSN-only probe), every command here does real writes against live tables
 (_users/_roles/_sessions/_access_keys) — so this always does a real
-`arc.boot()` + opens psqldb (and redix, when installed) rather than reading
+`arc.boot()` + opens pgdb (and redix, when installed) rather than reading
 connection settings straight off disk. Every mutation goes through
 `arc.relay.save()`/`arc.authn`'s own cache-invalidation helpers, never a
-raw psqldb write — a raw write would bypass the has_roles/scopes
+raw pgdb write — a raw write would bypass the has_roles/scopes
 validation hooks (authn/hooks/) or leave a stale redix cache entry behind
 (docs/arc.MD §3.13, docs/review-2026-07-14.md S1).
 """
@@ -26,9 +26,9 @@ from rich.console import Console
 from rich.table import Table
 
 # The same narrow, precedented exception relay/relay/__init__.py already
-# takes on psqldb's internals ("the only dependency Relay takes on
-# psqldb's internals") — ValidationError is only re-exported at
-# psqldb's own MODULE level (psqldb/__init__.py), not attached to the
+# takes on pgdb's internals ("the only dependency Relay takes on
+# pgdb's internals") — ValidationError is only re-exported at
+# pgdb's own MODULE level (pgdb/__init__.py), not attached to the
 # arc.pgdb capability INSTANCE the way relay.RelayError deliberately is
 # (docs/arc.MD §3.11), so there's no `arc.pgdb.ValidationError` to catch
 # without this.
@@ -61,7 +61,7 @@ def _friendly_errors():
     """Domain validation problems (bad email format, unique-constraint
     violation, a role that doesn't validate, a weak password) are user
     mistakes to fix, not internal failures — report them as a clean
-    one-line error, not a Python traceback. Mirrors psqldb.cli's own
+    one-line error, not a Python traceback. Mirrors pgdb.cli's own
     _friendly_errors() exactly."""
     try:
         yield

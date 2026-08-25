@@ -428,7 +428,7 @@ async def set_my_theme(theme: str, identity=None) -> dict:
     with no change needed here. This only enforces shape (matches
     _users.theme's own STRING(60) column), never a specific value list —
     same "DB/API tier enforces shape, app tier enforces meaning" split
-    psqldb's SELECT fields already use elsewhere."""
+    pgdb's SELECT fields already use elsewhere."""
     identity = _require_identity(identity)
     theme = theme.strip()
     if not theme or len(theme) > 60:
@@ -615,7 +615,7 @@ async def forgot_password(email: str, client_ip: str | None = None) -> dict:
     # dependency of authn (plugin.toml), so this module must stay importable
     # with `mail` absent; the hasattr() check above guarantees it's actually
     # installed by the time this line runs. Same narrow, precedented shape
-    # as authn.cli importing psqldb.validation.ValidationError directly.
+    # as authn.cli importing pgdb.validation.ValidationError directly.
     from mail import AccountNotFoundError, TemplateNotFoundError
 
     reset_url = f"{public_url.rstrip('/')}/reset-password?token={raw_token}"
