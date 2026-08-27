@@ -646,7 +646,7 @@ class AuthnProvider:
 
         cached = await self._cache_get_access_key(prefix)
         if cached is not None:
-            if not arc.verify_hash(arc.hash(raw), cached["key_hash"]):
+            if not arc.verify_hash(raw, cached["key_hash"]):
                 # Prefix matched a cache entry but the secret doesn't — a
                 # definitively invalid key, no need to fall through to the DB.
                 return None
@@ -672,7 +672,7 @@ class AuthnProvider:
             return None
         if access_key["expires_at"] is not None and access_key["expires_at"] <= arc.tz.utcnow():
             return None
-        if not arc.verify_hash(arc.hash(raw), access_key["key_hash"]):
+        if not arc.verify_hash(raw, access_key["key_hash"]):
             return None
 
         user = await arc.relay.get(
