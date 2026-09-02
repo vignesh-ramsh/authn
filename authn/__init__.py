@@ -794,8 +794,13 @@ def register(kernel: Any) -> None:
         kernel.advise(
             "authn: redix not installed — brute-force rate limiting falls back to a "
             "per-process, in-memory counter (not distributed across workers, reset on "
-            "restart). Account lockout (failed_login_count/locked_until) remains the "
-            "real backstop regardless. Install redix for real distributed rate limiting."
+            "restart). Because the counter is PER WORKER, the effective ceiling is "
+            "your configured limit multiplied by the worker count: login's own "
+            "10-per-60s budget becomes up to 80-per-60s across 8 gateway workers. "
+            "Account lockout (failed_login_count/locked_until) is DB-backed and "
+            "unaffected, so targeted guessing against one account stays bounded — it "
+            "is volume-based limiting that degrades here. Install redix for real "
+            "distributed rate limiting."
         )
 
     provider = AuthnProvider(kernel, redix=redix)

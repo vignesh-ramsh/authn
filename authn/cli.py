@@ -17,8 +17,11 @@ validation hooks (authn/hooks/) or leave a stale redix cache entry behind
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import getpass
 import secrets
+import socket
 
 import arc
 import typer
@@ -54,6 +57,27 @@ def _run(coro) -> None:
     # same as the old `hasattr(arc, "redix")` check, since run_async skips
     # any capability name that isn't actually registered this boot.
     arc.runtime.run_async(coro, open=("pgdb", "redix"))
+
+
+async def _hash_password(password: str) -> str:
+    """Argon2id in a worker thread, never on the event loop — ~100ms of
+    deliberate CPU+memory cost each time. Nothing else is usually in
+    flight in a CLI process, so this costs nothing here in practice; it
+    exists so this path matches what the server-side ones already do
+    (admin's create_user, auth_api's login) rather than being the one copy
+    that would stall a real request loop if it were ever reused."""
+    from argon2 import PasswordHasher
+
+    return await asyncio.to_thread(PasswordHasher().hash, password)
+
+
+def _cli_principal() -> str:
+    """Who to record as `by=` for a write made from this CLI. There's no
+    authenticated identity at a terminal, so this names the OS user and
+    host instead — "cli:vignesh@build-01" — which is both honest and
+    greppable. Anything is better than the NULL created_by these writes
+    used to leave on _users, the most security-sensitive table here."""
+    return f"cli:{getpass.getuser()}@{socket.gethostname()}"
 
 
 @contextlib.contextmanager
@@ -169,15 +193,20 @@ def create_user(
             password, min_score=arc.authn.min_password_score(), user_inputs=[email_norm]
         )
 
-        from argon2 import PasswordHasher
-
         user = await arc.relay.save(
             "_users",
             {
                 "email": email_norm,
-                "password_hash": PasswordHasher().hash(password),
+                "password_hash": await _hash_password(password),
                 "has_roles": roles,
             },
+            # Attribution, so a user created from a terminal is recorded AS
+            # that rather than as an unattributed system write — every
+            # admin-side path already passes `by=`, and created_by/
+            # updated_by hold the acting principal (project convention).
+            # This is the one write path that had no identity to name, so
+            # it names the shell instead of leaving the column NULL.
+            by=_cli_principal(),
         )
         _warn_if_superuser(roles, email=email_norm)
         if random_password:
@@ -282,16 +311,15 @@ def set_password(email: str = typer.Option(..., "--email")) -> None:
             password, min_score=arc.authn.min_password_score(), user_inputs=[user["email"]]
         )
 
-        from argon2 import PasswordHasher
-
         await arc.relay.save(
             "_users",
             {
                 "id": user["id"],
-                "password_hash": PasswordHasher().hash(password),
+                "password_hash": await _hash_password(password),
                 "failed_login_count": 0,
                 "locked_until": None,
             },
+            by=_cli_principal(),  # see create_user's own comment
         )
         sessions = await arc.relay.list(
             "_sessions",
