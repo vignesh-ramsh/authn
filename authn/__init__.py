@@ -47,6 +47,9 @@ from arc.settings import SettingsError
 
 from .hashing import DEFAULT_JSON as DEFAULT_HASHING_JSON
 from .hashing import HASHING_KEY, PasswordHashing, parse_config
+from .throttle import DEFAULT_JSON as DEFAULT_THROTTLE_JSON
+from .throttle import THROTTLE_KEY, LoginThrottle, ThrottleConfig
+from .throttle import parse_config as parse_throttle_config
 
 CAPABILITY = "authn"
 
@@ -222,12 +225,19 @@ def validate_password_strength(
 
 class AuthnProvider:
     def __init__(
-        self, kernel: Any, *, redix: Any | None = None, hashing: PasswordHashing | None = None
+        self,
+        kernel: Any,
+        *,
+        redix: Any | None = None,
+        hashing: PasswordHashing | None = None,
+        throttle: ThrottleConfig | None = None,
     ) -> None:
         self._kernel = kernel
         self._redix = redix
         #: Argon2 hashing with the parameters and the concurrency bound from `authn_argon2`.
         self.hashing = hashing or PasswordHashing(parse_config(None))
+        #: What a source address pays for failed logins: `authn_login_throttle`.
+        self.login_throttle = LoginThrottle(throttle or ThrottleConfig(), self)
         # Rate-limit fallback, used only when redix is absent — per-process,
         # not distributed, lost on restart (register()'s kernel.advise()
         # below says so at boot). Account lockout is the real backstop
@@ -261,6 +271,13 @@ class AuthnProvider:
     def password_needs_rehash(self, stored_hash: str) -> bool:
         """True if `stored_hash` was made with other parameters than the current ones."""
         return self.hashing.needs_rehash(stored_hash)
+
+    def is_trusted_network(self, client_ip: str | None) -> bool:
+        """Is this address in a network the operator listed in `gateway_rate_limit_exempt`? Asked
+        of the gateway, which owns that list, when one is installed."""
+        if not self._kernel.has("gateway"):
+            return False
+        return bool(self._kernel.get("gateway").is_rate_limit_exempt(client_ip))
 
     def _spawn(self, coro) -> None:
         task = asyncio.create_task(coro)
@@ -821,6 +838,18 @@ def register(kernel: Any) -> None:
         '{"memory_mb": 19, "time_cost": 2, "parallelism": 1}. Read at startup. Existing '
         "hashes keep verifying with their own parameters and are replaced at the owner's next login.",
     )
+    kernel.settings.declare(
+        THROTTLE_KEY,
+        type=str,
+        default=DEFAULT_THROTTLE_JSON,
+        doc="What a source address pays for FAILED logins, one JSON object; a key left out keeps its "
+        'default: {"max_failures": 60, "window_seconds": 60, "failure_delay_ms": 250}. After '
+        "max_failures failed logins from one address in a window, further attempts from it get 429 "
+        "until the window passes, before any hashing (0 turns the budget off). Successful logins do "
+        "not count, so an office behind one address is not affected. failure_delay_ms is the pause "
+        "before ANY failure is reported - unknown account or wrong password alike (0 turns it off). "
+        "Networks in gateway_rate_limit_exempt are not held to the budget. Read at startup.",
+    )
     kernel.settings.declare(PUBLIC_URL_KEY, doc="This instance's externally-reachable base URL.")
     kernel.settings.declare(
         CSRF_SECRET_KEY, secret=True, doc="Auto-generated at boot if unset."
@@ -855,7 +884,13 @@ def register(kernel: Any) -> None:
             f"19 MiB with time_cost 2 (or uses 46 MiB with time_cost 1). Passwords hashed with "
             f"fewer passes over less memory are cheaper to crack offline."
         )
-    provider = AuthnProvider(kernel, redix=redix, hashing=PasswordHashing(hashing_config))
+    try:
+        throttle_config = parse_throttle_config(kernel.settings.get(THROTTLE_KEY))
+    except ValueError as exc:
+        raise SettingsError(str(exc)) from exc
+    provider = AuthnProvider(
+        kernel, redix=redix, hashing=PasswordHashing(hashing_config), throttle=throttle_config
+    )
     # Export BEFORE registering hooks/api: auth_api.py's own whitelisted
     # functions declare roles=["*"] (a real role), and relay.whitelist()'s
     # boot-time guard hard-requires kernel.has("authn") to already be true

@@ -168,6 +168,17 @@ async def _authenticate_credentials(
         username = username.strip().lower()
         lookup, identifier = {"username": username}, username
 
+    # An address that has failed too many logins in this window (authn_login_throttle) is turned
+    # away here, before the lookup and before any hashing is spent on it. Only FAILURES count
+    # against it, so an office of hundreds behind one address, who nearly all succeed, never meets
+    # this - an attacker who fails nearly every time does.
+    if await arc.authn.login_throttle.is_blocked(client_ip):
+        arc.relay.throw(
+            "too many failed sign-in attempts from this network, try again shortly",
+            status=429,
+            code="too_many_failures",
+        )
+
     # Keyed on (client_ip, identifier), not identifier alone — a self-hosted
     # deployment where every legitimate user shares one public IP would
     # otherwise make the per-identifier budget the same as a single-attacker
@@ -199,7 +210,7 @@ async def _authenticate_credentials(
     )
 
     if user is None:
-        arc.relay.throw("invalid credentials", status=401, code="invalid_credentials")
+        await _reject_credentials(client_ip)
 
     # A lock that has already expired clears the strike counter before this
     # attempt is evaluated — otherwise a single wrong password right after
@@ -231,7 +242,7 @@ async def _authenticate_credentials(
         # is itself an account-enumeration/state-disclosure oracle (docs
         # review-2026-07-14.md S3). A genuinely locked/inactive user sees the same
         # message as a wrong password, by design.
-        arc.relay.throw("invalid credentials", status=401, code="invalid_credentials")
+        await _reject_credentials(client_ip)
 
     update = {
         "id": user["id"],
@@ -250,6 +261,16 @@ async def _authenticate_credentials(
             pass
     await arc.relay.save("_users", update)
     return user
+
+
+async def _reject_credentials(client_ip: str | None) -> None:
+    """Every failed login ends here - unknown account, wrong password, locked, inactive - and is
+    treated identically: counted against the source address's failure budget, held for the same
+    pause, answered with the same message. Any difference between the cases (a longer pause for an
+    unknown account, say) would let a caller tell which accounts exist."""
+    await arc.authn.login_throttle.record_failure(client_ip)
+    await arc.authn.login_throttle.pause()
+    arc.relay.throw("invalid credentials", status=401, code="invalid_credentials")
 
 
 def _check_allowed_source(user: dict, client_ip: str | None) -> None:
