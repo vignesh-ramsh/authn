@@ -26,23 +26,7 @@ from authn import (
     has_roles_subset,
     validate_password_strength,
 )
-
-_DUMMY_PASSWORD_HASH: str | None = None
-
-
-def _dummy_hash() -> str:
-    """A fixed Argon2id hash of a random, never-used password, computed
-    once lazily on first use — verified against on every login attempt for
-    an email that doesn't exist, so "no such user" costs the same wall-clock
-    time as "wrong password" and can't be distinguished by response timing
-    (docs/review-2026-07-14.md S3)."""
-    global _DUMMY_PASSWORD_HASH
-    if _DUMMY_PASSWORD_HASH is None:
-        from argon2 import PasswordHasher
-
-        _DUMMY_PASSWORD_HASH = PasswordHasher().hash(secrets.token_urlsafe(16))
-    return _DUMMY_PASSWORD_HASH
-
+from authn.hashing import HashingBusy
 
 def _require_identity(identity):
     if identity is None:
@@ -167,9 +151,6 @@ async def _authenticate_credentials(
     arc.relay.all_columns) on success; raises the same generic
     invalid_credentials RelayError either caller would raise anyway on any
     failure — unknown identifier, wrong password, locked, or inactive."""
-    from argon2 import PasswordHasher
-    from argon2.exceptions import VerificationError, VerifyMismatchError
-
     if not email and not username:
         arc.relay.throw("email or username is required", code="identifier_required")
 
@@ -205,21 +186,17 @@ async def _authenticate_credentials(
     user = await arc.relay.get("_users", lookup, arc.relay.all_columns("_users"))
 
     # Always pay exactly one Argon2 verify — against the real hash if the
-    # user exists, a fixed dummy hash otherwise — so response timing can't
-    # be used to enumerate valid emails (docs/review-2026-07-14.md S3). Run in a
-    # worker thread: Argon2id is ~100ms of deliberate CPU+memory cost, and
-    # doing it on the event loop stalled EVERY in-flight request for the
-    # duration of every login attempt (including the dummy-hash ones an
-    # attacker can generate freely).
-    try:
-        await asyncio.to_thread(
-            PasswordHasher().verify,
-            user["password_hash"] if user is not None else _dummy_hash(),
-            password,
-        )
-        password_ok = True
-    except (VerifyMismatchError, VerificationError):
-        password_ok = False
+    # user exists, a throwaway one otherwise (verify_password(None, ...)) — so
+    # response timing can't be used to enumerate valid emails
+    # (docs/review-2026-07-14.md S3). arc.authn runs it on a thread of its own, at
+    # most authn_argon2.max_concurrent at a time per worker: Argon2id costs
+    # deliberate memory, and an unbounded number at once (every login attempt,
+    # including the unknown-user ones an attacker generates freely) used to
+    # grow the workers by gigabytes. Beyond a short queue it raises HashingBusy,
+    # which the gateway answers 503 + Retry-After.
+    password_ok = await arc.authn.verify_password(
+        user["password_hash"] if user is not None else None, password
+    )
 
     if user is None:
         arc.relay.throw("invalid credentials", status=401, code="invalid_credentials")
@@ -256,15 +233,22 @@ async def _authenticate_credentials(
         # message as a wrong password, by design.
         arc.relay.throw("invalid credentials", status=401, code="invalid_credentials")
 
-    await arc.relay.save(
-        "_users",
-        {
-            "id": user["id"],
-            "failed_login_count": 0,
-            "locked_until": None,
-            "last_login_at": arc.tz.utcnow(),
-        },
-    )
+    update = {
+        "id": user["id"],
+        "failed_login_count": 0,
+        "locked_until": None,
+        "last_login_at": arc.tz.utcnow(),
+    }
+    # A hash made with other parameters than authn_argon2's current ones (the setting was lowered
+    # for a small machine, or raised) is replaced now, while the password is at hand - without
+    # this, lowering memory_mb would not ease the load of verifying the hashes already stored.
+    # A busy server skips it: the next login does it. A login that is correct never fails here.
+    if arc.authn.password_needs_rehash(user["password_hash"]):
+        try:
+            update["password_hash"] = await arc.authn.hash_password(password)
+        except HashingBusy:
+            pass
+    await arc.relay.save("_users", update)
     return user
 
 
@@ -673,9 +657,7 @@ async def reset_password(token: str, new_password: str, client_ip: str | None = 
     except PasswordPolicyError as exc:
         arc.relay.throw(str(exc), status=400, code="weak_password")
 
-    from argon2 import PasswordHasher
-
-    new_hash = await asyncio.to_thread(PasswordHasher().hash, new_password)
+    new_hash = await arc.authn.hash_password(new_password)
     await arc.relay.save(
         "_users",
         {

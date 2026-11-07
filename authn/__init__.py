@@ -43,6 +43,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 import arc
+from arc.settings import SettingsError
+
+from .hashing import DEFAULT_JSON as DEFAULT_HASHING_JSON
+from .hashing import HASHING_KEY, PasswordHashing, parse_config
 
 CAPABILITY = "authn"
 
@@ -217,9 +221,13 @@ def validate_password_strength(
 
 
 class AuthnProvider:
-    def __init__(self, kernel: Any, *, redix: Any | None = None) -> None:
+    def __init__(
+        self, kernel: Any, *, redix: Any | None = None, hashing: PasswordHashing | None = None
+    ) -> None:
         self._kernel = kernel
         self._redix = redix
+        #: Argon2 hashing with the parameters and the concurrency bound from `authn_argon2`.
+        self.hashing = hashing or PasswordHashing(parse_config(None))
         # Rate-limit fallback, used only when redix is absent — per-process,
         # not distributed, lost on restart (register()'s kernel.advise()
         # below says so at boot). Account lockout is the real backstop
@@ -234,6 +242,25 @@ class AuthnProvider:
         # task via the event loop, so a task with nothing else referencing
         # it can be garbage-collected mid-flight and silently cancelled.
         self._background_tasks: set[asyncio.Task] = set()
+
+    # ------------------------------------------------------------------ #
+    # Password hashing - the one place every caller (login, password
+    # reset, admin, the CLI) hashes and verifies, so they all use the
+    # configured parameters and share the bound on concurrent hashes.
+    # ------------------------------------------------------------------ #
+    async def hash_password(self, password: str) -> str:
+        """Argon2id hash of `password` with the current `authn_argon2` parameters. May raise
+        HashingBusy (503 + Retry-After at the gateway) when too many hashes are in flight."""
+        return await self.hashing.hash(password)
+
+    async def verify_password(self, stored_hash: str | None, password: str) -> bool:
+        """Does `password` match `stored_hash`? None (no such user) still costs one verification
+        and is always False, so unknown accounts cannot be told apart by timing."""
+        return await self.hashing.verify(stored_hash, password)
+
+    def password_needs_rehash(self, stored_hash: str) -> bool:
+        """True if `stored_hash` was made with other parameters than the current ones."""
+        return self.hashing.needs_rehash(stored_hash)
 
     def _spawn(self, coro) -> None:
         task = asyncio.create_task(coro)
@@ -780,6 +807,20 @@ def register(kernel: Any) -> None:
         default=DEFAULT_IMPERSONATION_TICKET_TTL_SECONDS,
         doc="Impersonation ticket TTL, in seconds.",
     )
+    kernel.settings.declare(
+        HASHING_KEY,
+        type=str,
+        default=DEFAULT_HASHING_JSON,
+        doc="Argon2id password hashing, one JSON object; a key left out keeps its default: "
+        '{"memory_mb": 64, "time_cost": 3, "parallelism": 4, "max_concurrent": 2, "max_waiting": 16}. '
+        "memory_mb (19-4096) is the memory one hash uses, time_cost the passes over it, "
+        "parallelism the threads it uses, max_concurrent how many hashes one worker process runs "
+        "at once (peak memory per process = memory_mb x max_concurrent), max_waiting how many more "
+        "may wait for a slot (it absorbs a burst of logins; the rest get 503 + Retry-After). "
+        "For a machine short of memory use "
+        '{"memory_mb": 19, "time_cost": 2, "parallelism": 1}. Read at startup. Existing '
+        "hashes keep verifying with their own parameters and are replaced at the owner's next login.",
+    )
     kernel.settings.declare(PUBLIC_URL_KEY, doc="This instance's externally-reachable base URL.")
     kernel.settings.declare(
         CSRF_SECRET_KEY, secret=True, doc="Auto-generated at boot if unset."
@@ -803,7 +844,18 @@ def register(kernel: Any) -> None:
             "distributed rate limiting."
         )
 
-    provider = AuthnProvider(kernel, redix=redix)
+    try:
+        hashing_config = parse_config(kernel.settings.get(HASHING_KEY))
+    except ValueError as exc:
+        raise SettingsError(str(exc)) from exc
+    if hashing_config.weaker_than_owasp_minimum:
+        kernel.advise(
+            f"authn: {HASHING_KEY} sets memory_mb={hashing_config.memory_mb} with "
+            f"time_cost={hashing_config.time_cost}; OWASP's smallest Argon2id profile pays for "
+            f"19 MiB with time_cost 2 (or uses 46 MiB with time_cost 1). Passwords hashed with "
+            f"fewer passes over less memory are cheaper to crack offline."
+        )
+    provider = AuthnProvider(kernel, redix=redix, hashing=PasswordHashing(hashing_config))
     # Export BEFORE registering hooks/api: auth_api.py's own whitelisted
     # functions declare roles=["*"] (a real role), and relay.whitelist()'s
     # boot-time guard hard-requires kernel.has("authn") to already be true

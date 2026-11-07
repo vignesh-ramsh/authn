@@ -17,7 +17,6 @@ validation hooks (authn/hooks/) or leave a stale redix cache entry behind
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import getpass
 import secrets
@@ -60,15 +59,10 @@ def _run(coro) -> None:
 
 
 async def _hash_password(password: str) -> str:
-    """Argon2id in a worker thread, never on the event loop — ~100ms of
-    deliberate CPU+memory cost each time. Nothing else is usually in
-    flight in a CLI process, so this costs nothing here in practice; it
-    exists so this path matches what the server-side ones already do
-    (admin's create_user, auth_api's login) rather than being the one copy
-    that would stall a real request loop if it were ever reused."""
-    from argon2 import PasswordHasher
-
-    return await asyncio.to_thread(PasswordHasher().hash, password)
+    """Argon2id with the parameters in `authn_argon2`, on a thread of authn's own - the same
+    path the server's login, password reset and admin create-user take, so a user created here
+    is hashed exactly like one created there."""
+    return await arc.authn.hash_password(password)
 
 
 def _cli_principal() -> str:
