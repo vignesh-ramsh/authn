@@ -799,73 +799,82 @@ def register(kernel: Any) -> None:
         SESSION_TTL_HOURS_KEY,
         type=int,
         default=DEFAULT_SESSION_TTL_HOURS,
-        doc="Fixed-session TTL, in hours.",
+        doc="How many hours a normal login lasts before the user has to log in again.",
     )
     kernel.settings.declare(
         EXTENDED_SESSION_TTL_DAYS_KEY,
         type=int,
         default=DEFAULT_EXTENDED_SESSION_TTL_DAYS,
-        doc="Extended-session TTL, in days.",
+        doc="How many days a 'keep me signed in' (extended) login lasts before the user has to log in again.",
     )
     kernel.settings.declare(
         LOCKOUT_THRESHOLD_KEY,
         type=int,
         default=DEFAULT_LOCKOUT_THRESHOLD,
-        doc="Failed login attempts before an account locks.",
+        doc="How many wrong passwords in a row lock an account. The lock lasts for `authn_lockout_minutes`.",
     )
     kernel.settings.declare(
         LOCKOUT_MINUTES_KEY,
         type=int,
         default=DEFAULT_LOCKOUT_MINUTES,
-        doc="How long a lockout lasts, in minutes.",
+        doc="How many minutes an account stays locked after too many wrong passwords.",
     )
     kernel.settings.declare(
         MIN_PASSWORD_SCORE_KEY,
         type=int,
         default=DEFAULT_MIN_PASSWORD_SCORE,
-        doc="Minimum zxcvbn score (0-4) a new password must meet.",
+        doc="How strong a new password must be, from 0 (very weak) to 4 (very strong), as scored by the zxcvbn "
+        "password checker. A weaker password is refused.",
     )
     kernel.settings.declare(
         RESET_TOKEN_TTL_MINUTES_KEY,
         type=int,
         default=DEFAULT_RESET_TOKEN_TTL_MINUTES,
-        doc="Password-reset token TTL, in minutes.",
+        doc="How many minutes a password-reset link works after it is sent.",
     )
     kernel.settings.declare(
         IMPERSONATION_TICKET_TTL_SECONDS_KEY,
         type=int,
         default=DEFAULT_IMPERSONATION_TICKET_TTL_SECONDS,
-        doc="Impersonation ticket TTL, in seconds.",
+        doc="How many seconds the one-time ticket for 'browse as another user' stays valid after an administrator "
+        "creates it. After that it is refused.",
     )
     kernel.settings.declare(
         HASHING_KEY,
         type=str,
         default=DEFAULT_HASHING_JSON,
-        doc="Argon2id password hashing, one JSON object; a key left out keeps its default: "
-        '{"memory_mb": 64, "time_cost": 3, "parallelism": 1, "max_concurrent": 2, "max_waiting": 16}. '
-        "memory_mb (19-4096) is the memory one hash uses, time_cost the passes over it, "
-        "parallelism the threads it uses, max_concurrent how many hashes one worker process runs "
-        "at once (peak memory per process = memory_mb x max_concurrent), max_waiting how many more "
-        "may wait for a slot (it absorbs a burst of logins; the rest get 503 + Retry-After). "
-        "For a machine short of memory use "
-        '{"memory_mb": 19, "time_cost": 2, "parallelism": 1}. Read at startup. Existing '
-        "hashes keep verifying with their own parameters and are replaced at the owner's next login.",
+        doc="How passwords are scrambled (hashed) before they are stored, as one JSON object. A key you leave out "
+        "keeps its default: `{\"memory_mb\": 64, \"time_cost\": 3, \"parallelism\": 1, \"max_concurrent\": 2, "
+        "\"max_waiting\": 16}`. `memory_mb` (19-4096) is the memory one hash uses. `time_cost` is how many "
+        "passes it makes. `parallelism` is how many threads one hash uses. `max_concurrent` is how many hashes "
+        "one web worker runs at the same time. `max_waiting` is how many more may wait for a turn; any beyond "
+        "that get a 503 'try again' answer. A server short of memory can use `{\"memory_mb\": 19, \"time_cost\": "
+        "2, \"parallelism\": 1}`. Read when ARC starts. Existing passwords keep working and are saved again with "
+        "the new numbers the next time their owner logs in.",
     )
     kernel.settings.declare(
         THROTTLE_KEY,
         type=str,
         default=DEFAULT_THROTTLE_JSON,
-        doc="What a source address pays for FAILED logins, one JSON object; a key left out keeps its "
-        'default: {"max_failures": 60, "window_seconds": 60, "failure_delay_ms": 250}. After '
-        "max_failures failed logins from one address in a window, further attempts from it get 429 "
-        "until the window passes, before any hashing (0 turns the budget off). Successful logins do "
-        "not count, so an office behind one address is not affected. failure_delay_ms is the pause "
-        "before ANY failure is reported - unknown account or wrong password alike (0 turns it off). "
-        "Networks in gateway_rate_limit_exempt are not held to the budget. Read at startup.",
+        doc="What one network address pays for FAILED logins, as one JSON object. A key you leave out keeps its "
+        "default: `{\"max_failures\": 60, \"window_seconds\": 60, \"failure_delay_ms\": 250}`. After `max_failures` "
+        "failed logins from one address within `window_seconds`, further attempts from it get a 429 'too many "
+        "requests' answer until the time is up (0 turns this off). Successful logins are not counted, so an "
+        "office sharing one address is not affected. `failure_delay_ms` is a short pause before ANY failed "
+        "login is answered, whether the account exists or not (0 turns it off). Addresses in "
+        "`gateway_rate_limit_exempt` are not limited. Read when ARC starts.",
     )
-    kernel.settings.declare(PUBLIC_URL_KEY, doc="This instance's externally-reachable base URL.")
     kernel.settings.declare(
-        CSRF_SECRET_KEY, secret=True, doc="Auto-generated at boot if unset."
+        PUBLIC_URL_KEY,
+        doc="The web address people use to reach this ARC, for example `https://erp.example.com`. ARC puts it in "
+        "the links it emails, such as password-reset links, and in 'browse as' links. Leave it empty only if "
+        "you use neither.",
+    )
+    kernel.settings.declare(
+        CSRF_SECRET_KEY, secret=True,
+        doc="A private key ARC uses to protect signed-in browsers from cross-site request forgery (another website "
+        "tricking your browser into sending a request). ARC creates it by itself the first time it starts, so "
+        "you normally never set it."
     )
     _ensure_csrf_secret(kernel)
 
