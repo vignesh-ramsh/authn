@@ -268,6 +268,19 @@ class AuthnProvider:
         and is always False, so unknown accounts cannot be told apart by timing."""
         return await self.hashing.verify(stored_hash, password)
 
+    def web_worker_cpu_demand(self) -> dict[str, Any]:
+        """The most threads one web worker can spend on password hashing at once (hashes at a time x threads
+        each). `arc doctor --deep` multiplies it by the web workers and compares it with the cores."""
+        config = self.hashing.config
+        return {
+            "what": f"password hashing ({HASHING_KEY}: {config.max_concurrent} at once x {config.parallelism} thread(s))",
+            "threads": config.max_concurrent * config.parallelism,
+            "advice": f"A flood of logins for accounts that do not exist would take that much. Lower `parallelism` "
+            f"(the same strength on fewer threads; 1 is OWASP's) or `max_concurrent` in {HASHING_KEY}; each hash "
+            f"then takes longer, and the logins a second the server can do is web workers x max_concurrent / "
+            f"(the time one takes).",
+        }
+
     def password_needs_rehash(self, stored_hash: str) -> bool:
         """True if `stored_hash` was made with other parameters than the current ones."""
         return self.hashing.needs_rehash(stored_hash)
@@ -829,7 +842,7 @@ def register(kernel: Any) -> None:
         type=str,
         default=DEFAULT_HASHING_JSON,
         doc="Argon2id password hashing, one JSON object; a key left out keeps its default: "
-        '{"memory_mb": 64, "time_cost": 3, "parallelism": 4, "max_concurrent": 2, "max_waiting": 16}. '
+        '{"memory_mb": 64, "time_cost": 3, "parallelism": 1, "max_concurrent": 2, "max_waiting": 16}. '
         "memory_mb (19-4096) is the memory one hash uses, time_cost the passes over it, "
         "parallelism the threads it uses, max_concurrent how many hashes one worker process runs "
         "at once (peak memory per process = memory_mb x max_concurrent), max_waiting how many more "

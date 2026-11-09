@@ -11,11 +11,13 @@ slowed down behind them (p99 250 ms for a bystander), whichever IPs the attempts
 
 The setting `authn_argon2` is one JSON object; any key left out keeps its default:
 
-    {"memory_mb": 64, "time_cost": 3, "parallelism": 4, "max_concurrent": 2, "max_waiting": 16}
+    {"memory_mb": 64, "time_cost": 3, "parallelism": 1, "max_concurrent": 2, "max_waiting": 16}
 
     memory_mb       memory one hash uses, in MiB (19 to 4096).
     time_cost       passes over that memory (1 to 20).
-    parallelism     Argon2's own lanes = threads one hash uses (1 to 16).
+    parallelism     Argon2's own lanes = threads one hash uses (1 to 16). It spreads the same work over
+                    that many threads; it is the memory and the passes, not this, that make a password
+                    costly to crack (OWASP's Argon2id profiles all use 1).
     max_concurrent  hashes one worker process runs at once (1 to 64). Peak memory per process is
                     memory_mb x max_concurrent.
     max_waiting     how many more may wait for a slot (0 to 10000). A waiting login costs an open
@@ -24,10 +26,19 @@ The setting `authn_argon2` is one JSON object; any key left out keeps its defaul
                     Anything beyond is refused at once with 503 + Retry-After rather than queued
                     without bound.
 
+What a flood of logins can take: web workers x max_concurrent x parallelism threads, at once. Measured on a
+12-core machine, one hash (64 MiB, 3 passes) takes 66 ms on 4 threads and 163 ms on 1; four at once cost 326
+CPU-ms each on 4 threads and 214 on 1. The default used to be 4 threads: 2 web workers x 2 hashes x 4 = 16
+threads on 12 cores, and a load test of unknown-account logins took 9-10 of them. At 1 it is 4 threads, a
+third of that machine, for the same strength; a single login takes about 100 ms longer, and the most logins a
+second the server can do is web workers x max_concurrent / (the 160-230 ms one takes).
+
 On a machine short of memory, lower it - OWASP's smallest profile is
 {"memory_mb": 19, "time_cost": 2, "parallelism": 1}. Only NEW hashes use the new numbers: a
 stored hash carries its own, so one made at 64 MiB is still verified at 64 MiB, then replaced by
-one made with the current settings the next time its owner logs in.
+one made with the current settings the next time its owner logs in (which is what happens to every
+password stored before the default became parallelism 1: it verifies as before, and that login stores a
+new one).
 """
 
 from __future__ import annotations
@@ -44,10 +55,11 @@ from argon2.exceptions import VerificationError, VerifyMismatchError
 
 HASHING_KEY = "authn_argon2"
 
-#: The argon2-cffi defaults (RFC 9106's low-memory profile), so hashes made before this setting
-#: existed are not "outdated", plus 2 concurrent hashes per process.
+#: argon2-cffi's memory and passes (RFC 9106's low-memory profile) on ONE thread, plus 2 concurrent hashes per
+#: process. Hashes made before this setting existed, or with parallelism 4, are replaced at their owner's next
+#: login. See the module docstring for why one thread.
 DEFAULTS: dict[str, int] = {
-    "memory_mb": 64, "time_cost": 3, "parallelism": 4, "max_concurrent": 2, "max_waiting": 16,
+    "memory_mb": 64, "time_cost": 3, "parallelism": 1, "max_concurrent": 2, "max_waiting": 16,
 }
 DEFAULT_JSON = json.dumps(DEFAULTS)
 
@@ -66,7 +78,7 @@ LIMITS: dict[str, tuple[int, int]] = {
 class HashingConfig:
     memory_mb: int = 64
     time_cost: int = 3
-    parallelism: int = 4
+    parallelism: int = 1
     max_concurrent: int = 2
     max_waiting: int = 16
 
