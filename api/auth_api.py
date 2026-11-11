@@ -232,11 +232,9 @@ async def _authenticate_credentials(
         # rate limiter above already bounds attempt volume), so this
         # doesn't pile strikes on top of an existing lock.
         if not password_ok and not locked:
-            new_count = (user["failed_login_count"] or 0) + 1
-            update = {"id": user["id"], "failed_login_count": new_count}
-            if new_count >= arc.authn.lockout_threshold():
-                update["locked_until"] = arc.tz.add(seconds=arc.authn.lockout_seconds())
-            await arc.relay.save("_users", update)
+            # Counted by the database in one statement (it also sets locked_until once the count
+            # reaches the threshold): a read-then-save here let parallel guesses count as one.
+            await arc.authn.record_failed_login(user["id"])
         # One generic message regardless of WHY this failed (unknown email,
         # wrong password, locked, inactive) — a distinct message per case
         # is itself an account-enumeration/state-disclosure oracle (docs
@@ -526,23 +524,19 @@ async def impersonate_consume(ticket: str) -> Any:
     against another account's session budget, not a login on that user's
     own behalf, and shouldn't be blocked by however many sessions that
     user already has open elsewhere."""
-    ticket_hash = arc.hash(ticket)
-    row = await arc.relay.get(
-        "_impersonation_tickets",
-        {"token_hash": ticket_hash},
-        ["id", "used_at", "expires_at", "user"],
+    # Checked AND marked used by one statement, before the session is created — a ticket is
+    # single-use regardless of whether session creation below succeeds, and two requests
+    # presenting the same ticket at once cannot both get through (a failure partway through must
+    # never leave a still-consumable ticket behind either).
+    row = await arc.authn.consume_one_time_token(
+        "_impersonation_tickets", arc.hash(ticket)
     )
-    if row is None or row["used_at"] is not None or row["expires_at"] <= arc.tz.utcnow():
+    if row is None:
         arc.relay.throw("invalid or expired impersonation link", status=400, code="invalid_ticket")
 
     user = await arc.relay.get("_users", row["user"], ["id", "status"])
     if user is None or user["status"] != "Active":
         arc.relay.throw("invalid or expired impersonation link", status=400, code="invalid_ticket")
-
-    # Marked used BEFORE the session is created — a ticket is single-use
-    # regardless of whether session creation below succeeds; a failure
-    # partway through must never leave a still-consumable ticket behind.
-    await arc.relay.save("_impersonation_tickets", {"id": row["id"], "used_at": arc.tz.utcnow()})
 
     token = secrets.token_urlsafe(32)
     ttl = arc.authn.session_ttl_seconds("Fixed")
@@ -654,9 +648,13 @@ async def reset_password(token: str, new_password: str, client_ip: str | None = 
     if not await arc.authn.rate_limit(rate_key, limit=20, window_seconds=300):
         arc.relay.throw("too many requests, try again shortly", status=429, code="rate_limited")
 
+    token_hash = arc.hash(token)
+    # A first, cheap look so a token that is plainly wrong never costs a zxcvbn score and an
+    # Argon2 hash. It decides nothing: the token is only really spent by consume_one_time_token()
+    # below, which re-checks it atomically.
     reset = await arc.relay.get(
         "_password_resets",
-        {"token_hash": arc.hash(token)},
+        {"token_hash": token_hash},
         ["id", "used_at", "expires_at", "user"],
     )
     if reset is None or reset["used_at"] is not None or reset["expires_at"] <= arc.tz.utcnow():
@@ -679,6 +677,12 @@ async def reset_password(token: str, new_password: str, client_ip: str | None = 
         arc.relay.throw(str(exc), status=400, code="weak_password")
 
     new_hash = await arc.authn.hash_password(new_password)
+
+    # The token is spent here, after the slow work and before anything is changed: of two
+    # requests presenting the same link only one gets past this line.
+    if await arc.authn.consume_one_time_token("_password_resets", token_hash) is None:
+        arc.relay.throw("invalid or expired reset link", status=400, code="invalid_reset_token")
+
     await arc.relay.save(
         "_users",
         {
@@ -688,23 +692,12 @@ async def reset_password(token: str, new_password: str, client_ip: str | None = 
             "locked_until": None,
         },
     )
-    await arc.relay.save("_password_resets", {"id": reset["id"], "used_at": arc.tz.utcnow()})
 
     # Sessions only — access keys deliberately left alone: a leaked
     # password compromises interactive sessions, not a separately-issued
-    # API credential the user chose to create and scope themselves. Same
-    # revoke loop as `arc authn set-password` (cli.py) — a 3rd copy of it
-    # (clear-sessions is the other), not factored into a shared helper,
-    # matching this feature's own "small, matching, no premature
-    # abstraction" preference elsewhere.
-    sessions = await arc.relay.list(
-        "_sessions",
-        fields=["id", "token_hash"],
-        filters={"user": user["id"], "revoked_at": {"is_null": True}},
-    )
-    for s in sessions:
-        await arc.relay.save("_sessions", {"id": s["id"], "revoked_at": arc.tz.utcnow()})
-        await arc.authn.invalidate_session_cache(s["token_hash"])
+    # API credential the user chose to create and scope themselves. ALL of
+    # the user's sessions end, however many there are (see revoke_user_sessions).
+    await arc.authn.revoke_user_sessions(user["id"])
 
     return {"ok": True}
 

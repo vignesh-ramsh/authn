@@ -110,6 +110,9 @@ SUPERUSER_ROLE_NAME = "Superuser"
 # used to look the row up before verifying the full key's hash.
 KEY_PREFIX_LEN = 12
 
+#: The tables consume_one_time_token() may touch - interpolated into SQL, so a closed list.
+_ONE_TIME_TOKEN_TABLES = frozenset({"_password_resets", "_impersonation_tickets"})
+
 # An access key's redix cache entry is capped at this TTL even when the key
 # itself never expires (expires_at is None) — bounds how long a missed
 # invalidation (a bug, not the normal path — see hooks/_users.py) could stay
@@ -552,16 +555,94 @@ class AuthnProvider:
     # IP-list change), never on the hot request path.
     # ------------------------------------------------------------------ #
     async def invalidate_user_cache(self, user_id: Any) -> None:
+        # limit=None, not relay.list()'s default of 20: only a session or key that is still usable
+        # can be sitting in the cache, and every one of them must be cleared. With the default, a
+        # user's 21st-newest live session kept its old roles and its "Active" status in the cache.
         sessions = await arc.relay.list(
-            "_sessions", filters={"user": user_id}, fields=["token_hash"]
+            "_sessions",
+            filters={
+                "user": user_id,
+                "revoked_at": {"is_null": True},
+                "expires_at": {"gt": arc.tz.utcnow()},
+            },
+            fields=["token_hash"],
+            limit=None,
         )
         for s in sessions:
             await self.invalidate_session_cache(s["token_hash"])
         keys = await arc.relay.list(
-            "_access_keys", filters={"user": user_id}, fields=["key_prefix"]
+            "_access_keys",
+            filters={"user": user_id, "revoked_at": {"is_null": True}},
+            fields=["key_prefix"],
+            limit=None,
         )
         for k in keys:
             await self.invalidate_access_key_cache(k["key_prefix"])
+
+    async def revoke_user_sessions(self, user_id: Any, *, by: str | None = None) -> int:
+        """Ends EVERY session of `user_id` that has not been revoked yet, in one statement, and
+        clears each live one from the session cache. Returns how many live (not yet expired)
+        sessions that was.
+
+        Used wherever a password changes, so that whoever knew the old password is signed out.
+        It is one UPDATE rather than a list-then-save loop on purpose: `relay.list()` returns 20
+        rows unless told otherwise, and a loop over that page left a user's older sessions signed
+        in after the password reset that was supposed to end them. Expired sessions are marked
+        revoked too (they are dead anyway); they just are not counted or evicted from the cache.
+        `by` is recorded as `updated_by`, which is what the audit trail shows as the actor."""
+        now = arc.tz.utcnow()
+        rows = await arc.relay.sql(
+            'UPDATE "_sessions" SET revoked_at = $1, updated_by = $2 '
+            'WHERE "user" = $3 AND revoked_at IS NULL RETURNING token_hash, expires_at',
+            now,
+            by,
+            user_id,
+        )
+        live = [row for row in rows if row["expires_at"] > now]
+        for row in live:
+            await self.invalidate_session_cache(row["token_hash"])
+        return len(live)
+
+    # ------------------------------------------------------------------ #
+    # Read-modify-write races on the auth tables. Each of these is ONE statement, so two
+    # requests arriving together cannot both see the old state.
+    # ------------------------------------------------------------------ #
+    async def record_failed_login(self, user_id: Any) -> int:
+        """Counts one wrong password against `user_id` and locks the account when the count
+        reaches the lockout threshold. Returns the new count.
+
+        The increment happens inside the database. It used to be "read the count, add one, save
+        it", so a burst of parallel guesses all read the same number and counted as one failure:
+        N simultaneous requests bought N guesses for the price of one strike."""
+        row = await arc.relay.sql_one(
+            'UPDATE "_users" SET '
+            "failed_login_count = COALESCE(failed_login_count, 0) + 1, "
+            "locked_until = CASE WHEN COALESCE(failed_login_count, 0) + 1 >= $2 "
+            "THEN $3 ELSE locked_until END "
+            "WHERE id = $1 RETURNING failed_login_count",
+            user_id,
+            self.lockout_threshold(),
+            arc.tz.add(seconds=self.lockout_seconds()),
+        )
+        return int(row["failed_login_count"]) if row else 0
+
+    async def consume_one_time_token(self, table: str, token_hash: str) -> dict | None:
+        """Marks a single-use token used and returns its row (`id`, `user`), or None if there is
+        no such token, it was already used, or it has expired - decided by the same statement that
+        marks it, so of two requests presenting one token exactly one gets the row.
+
+        `table` is `_password_resets` or `_impersonation_tickets`. The old shape was "read the
+        row, check `used_at`, do the work, save `used_at`": two requests in the gap both passed the
+        check, so a reset link or a browse-as link could be used twice."""
+        if table not in _ONE_TIME_TOKEN_TABLES:
+            raise ValueError(f"{table!r} is not a single-use token table")
+        return await arc.relay.sql_one(
+            f'UPDATE "{table}" SET used_at = $1 '
+            "WHERE token_hash = $2 AND used_at IS NULL AND expires_at > $1 "
+            'RETURNING id, "user"',
+            arc.tz.utcnow(),
+            token_hash,
+        )
 
     # ------------------------------------------------------------------ #
     # last_used_at — throttled (see ACCESS_KEY_TOUCH_THROTTLE_SECONDS) and,

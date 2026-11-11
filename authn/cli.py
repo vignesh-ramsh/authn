@@ -315,16 +315,9 @@ def set_password(email: str = typer.Option(..., "--email")) -> None:
             },
             by=_cli_principal(),  # see create_user's own comment
         )
-        sessions = await arc.relay.list(
-            "_sessions",
-            fields=["id", "token_hash"],
-            filters={"user": user["id"], "revoked_at": {"is_null": True}},
-        )
-        for s in sessions:
-            await arc.relay.save("_sessions", {"id": s["id"], "revoked_at": arc.tz.utcnow()})
-            await arc.authn.invalidate_session_cache(s["token_hash"])
+        revoked = await arc.authn.revoke_user_sessions(user["id"], by=_cli_principal())
         console.print(
-            f"[bold green]{user['email']}: password updated, {len(sessions)} active session(s) revoked.[/bold green]"
+            f"[bold green]{user['email']}: password updated, {revoked} active session(s) revoked.[/bold green]"
         )
 
     with _friendly_errors():
