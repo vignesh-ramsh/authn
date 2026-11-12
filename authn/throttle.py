@@ -42,6 +42,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from arc.expiring import Pruner
+
 THROTTLE_KEY = "authn_login_throttle"
 
 DEFAULTS: dict[str, int] = {"max_failures": 60, "window_seconds": 60, "failure_delay_ms": 250}
@@ -100,6 +102,7 @@ class LoginThrottle:
         self.config = config
         self._provider = provider  # AuthnProvider: rate_limit(), its redix client, is_trusted_network()
         self._blocked_local: dict[str, float] = {}  # address -> monotonic time the block ends
+        self._blocked_pruner = Pruner(threshold=_FALLBACK_PRUNE_THRESHOLD)
 
     def _applies_to(self, client_ip: str | None) -> bool:
         return (
@@ -143,8 +146,8 @@ class LoginThrottle:
             except Exception as exc:  # noqa: BLE001
                 _logger.warning("login throttle: redix write failed (%s) - blocking in-process only", exc)
         now = time.monotonic()
-        if len(self._blocked_local) > _FALLBACK_PRUNE_THRESHOLD:  # keys are attacker-chosen addresses
-            self._blocked_local = {ip: until for ip, until in self._blocked_local.items() if until > now}
+        # keys are attacker-chosen addresses: stale blocks leave on a timer, memory stays bounded
+        self._blocked_pruner.prune(self._blocked_local, lambda until: until <= now, now)
         self._blocked_local[client_ip] = now + window
 
     async def pause(self) -> None:

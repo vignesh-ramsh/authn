@@ -35,6 +35,7 @@ import hashlib
 import hmac
 import ipaddress
 import logging
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -43,10 +44,16 @@ from pathlib import Path
 from typing import Any, Literal
 
 import arc
+from arc.expiring import Pruner
 from arc.settings import SettingsError
 
 from .hashing import DEFAULT_JSON as DEFAULT_HASHING_JSON
 from .hashing import HASHING_KEY, PasswordHashing, parse_config
+from .retention import (
+    SESSION_RETENTION_DAYS_KEY,
+    TOKEN_RETENTION_DAYS_KEY,
+    purge_finished_auth_rows,
+)
 from .throttle import DEFAULT_JSON as DEFAULT_THROTTLE_JSON
 from .throttle import THROTTLE_KEY, LoginThrottle, ThrottleConfig
 from .throttle import parse_config as parse_throttle_config
@@ -58,8 +65,13 @@ _logger = logging.getLogger("authn")
 # In-process fallback dicts (_rate_local/_touch_local) are pruned once they
 # cross this size — without redix they're keyed by attacker-influenced
 # values ((client_ip, email) pairs), so "never pruned" was an unbounded,
-# externally growable memory leak.
+# externally growable memory leak. Pruned on a timer (arc.expiring.Pruner),
+# not on every call: above the threshold every call used to rebuild the whole
+# dict, 486 us at 5,000 keys and 2,480 us at 50,000.
 _FALLBACK_DICT_PRUNE_THRESHOLD = 4096
+
+#: how many session cache entries revoke_all_sessions() clears at once
+_SESSION_CACHE_CLEAR_CHUNK = 200
 
 SESSION_TTL_HOURS_KEY = "authn_session_ttl_hours"
 EXTENDED_SESSION_TTL_DAYS_KEY = "authn_extended_session_ttl_days"
@@ -104,6 +116,13 @@ DEFAULT_IMPERSONATION_TICKET_TTL_SECONDS = 60
 # and resolve_identity's API-key path never even checks for it — see
 # _resolve_api_key) — a leaked API key must never be able to carry this.
 SUPERUSER_ROLE_NAME = "Superuser"
+
+# What a real credential looks like. A session token is secrets.token_urlsafe(32) (43 url-safe characters) and an
+# access key is "ak_" + the same. A value of any other shape cannot be one this provider ever issued, so it is
+# anonymous at once - no cache read, no database query. A flood of requests with made-up cookies used to cost both,
+# per request, before the rate limiter ever saw them. (The upper bound only keeps a huge value out of the lookup.)
+_SESSION_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43,128}")
+_ACCESS_KEY_RE = re.compile(r"ak_[A-Za-z0-9_-]{43,128}")
 
 # Access keys look like "ak_<43 url-safe chars>" (secrets.token_urlsafe(32)).
 # key_prefix is the first KEY_PREFIX_LEN characters — safe to display/log,
@@ -246,10 +265,12 @@ class AuthnProvider:
         # below says so at boot). Account lockout is the real backstop
         # regardless of this — see api/auth_api.py's login().
         self._rate_local: dict[str, tuple[int, float]] = {}
+        self._rate_pruner = Pruner(threshold=_FALLBACK_DICT_PRUNE_THRESHOLD)
         self._rate_lock = asyncio.Lock()
         # Same per-process fallback shape, for the last_used_at write
         # throttle below, when redix is absent.
         self._touch_local: dict[str, float] = {}
+        self._touch_pruner = Pruner(threshold=_FALLBACK_DICT_PRUNE_THRESHOLD)
         # Strong references to fire-and-forget background tasks (the
         # last_used_at write) — asyncio only holds a WEAK reference to a
         # task via the event loop, so a task with nothing else referencing
@@ -417,12 +438,7 @@ class AuthnProvider:
             now = time.monotonic()
             # Prune expired windows once the dict grows past the threshold —
             # keys are (client_ip, identifier) shaped, i.e. attacker-growable.
-            if len(self._rate_local) > _FALLBACK_DICT_PRUNE_THRESHOLD:
-                self._rate_local = {
-                    k: (c, start)
-                    for k, (c, start) in self._rate_local.items()
-                    if now - start < window_seconds
-                }
+            self._rate_pruner.prune(self._rate_local, lambda entry: now - entry[1] >= window_seconds, now)
             count, window_start = self._rate_local.get(key, (0, now))
             if now - window_start >= window_seconds:
                 count, window_start = 0, now
@@ -603,6 +619,30 @@ class AuthnProvider:
             await self.invalidate_session_cache(row["token_hash"])
         return len(live)
 
+    async def revoke_all_sessions(self, *, by: str | None = None) -> int:
+        """Ends EVERY session of EVERY user that has not been revoked yet, with one UPDATE, and
+        clears each live one from the session cache. Returns how many live (not yet expired) sessions
+        that was. The admin "sign everyone out" action; it used to fetch every session and save them
+        one at a time.
+
+        The UPDATE and the cache clearing share one transaction: clearing a cache entry deliberately
+        raises when Redis fails (a revoked session that stays honoured is worse than an error), and
+        then nothing has been revoked, so the same call can simply be repeated."""
+        now = arc.tz.utcnow()
+        async with arc.pgdb.acquire() as conn, conn.transaction():
+            rows = await conn.fetch(
+                'UPDATE "_sessions" SET revoked_at = $1, updated_by = $2 '
+                "WHERE revoked_at IS NULL RETURNING token_hash, expires_at",
+                now,
+                by,
+            )
+            live = [row["token_hash"] for row in rows if row["expires_at"] > now]
+            for start in range(0, len(live), _SESSION_CACHE_CLEAR_CHUNK):
+                await asyncio.gather(
+                    *(self.invalidate_session_cache(h) for h in live[start : start + _SESSION_CACHE_CLEAR_CHUNK])
+                )
+        return len(live)
+
     # ------------------------------------------------------------------ #
     # Read-modify-write races on the auth tables. Each of these is ONE statement, so two
     # requests arriving together cannot both see the old state.
@@ -665,12 +705,9 @@ class AuthnProvider:
                 _logger.warning("last_used_at throttle check failed (%s) — skipping touch", exc)
                 return False
         now = time.monotonic()
-        if len(self._touch_local) > _FALLBACK_DICT_PRUNE_THRESHOLD:
-            self._touch_local = {
-                k: t
-                for k, t in self._touch_local.items()
-                if now - t < ACCESS_KEY_TOUCH_THROTTLE_SECONDS
-            }
+        self._touch_pruner.prune(
+            self._touch_local, lambda t: now - t >= ACCESS_KEY_TOUCH_THROTTLE_SECONDS, now
+        )
         last = self._touch_local.get(access_key_id, 0.0)
         if now - last < ACCESS_KEY_TOUCH_THROTTLE_SECONDS:
             return False
@@ -719,7 +756,7 @@ class AuthnProvider:
 
     async def _resolve_session(self, token: str, scope: dict) -> Identity | None:
         token = token.strip()
-        if not token:
+        if not _SESSION_TOKEN_RE.fullmatch(token):
             return None
         token_hash = arc.hash(token)
 
@@ -778,7 +815,7 @@ class AuthnProvider:
 
     async def _resolve_api_key(self, api_key_header: bytes, scope: dict) -> Identity | None:
         raw = api_key_header.decode("latin-1").strip()
-        if len(raw) <= KEY_PREFIX_LEN:
+        if not _ACCESS_KEY_RE.fullmatch(raw):
             return None
         prefix = raw[:KEY_PREFIX_LEN]
 
@@ -873,6 +910,20 @@ def _ensure_csrf_secret(kernel: Any) -> None:
 
 
 def register(kernel: Any) -> None:
+    kernel.settings.declare(
+        SESSION_RETENTION_DAYS_KEY,
+        type=int,
+        default=30,
+        doc="How many days ARC keeps a login session after it ended (signed out, or ran out) before deleting it "
+        "in the nightly clean-up. A session that is still valid is never deleted. 0 keeps them all.",
+    )
+    kernel.settings.declare(
+        TOKEN_RETENTION_DAYS_KEY,
+        type=int,
+        default=7,
+        doc="How many days ARC keeps a password-reset or impersonation link after it was used or ran out before "
+        "deleting it in the nightly clean-up. A link that is still valid is never deleted. 0 keeps them all.",
+    )
     # Typed declare (§1 P0) — get() below returns a real int, defaulted,
     # and a hand-edited non-numeric value fails at arc.boot() rather than
     # wherever the first login/reset/impersonation call happens to land.
@@ -1009,3 +1060,6 @@ def register(kernel: Any) -> None:
     relay = kernel.get("relay")
     relay.register_hooks(Path(__file__).parent.parent / "hooks")
     relay.register_api(Path(__file__).parent.parent / "api")
+    # nightly clean-up of finished sessions and one-time tokens (authn/retention.py), through the same facade
+    # every plugin uses; relay's own maintenance job is registered the same way
+    relay.task(queue="default", cron="10 2 * * *")(purge_finished_auth_rows)
