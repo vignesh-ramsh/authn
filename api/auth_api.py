@@ -20,9 +20,13 @@ import arc
 
 from authn import (
     KEY_PREFIX_LEN,
+    MAX_IDENTIFIER_LENGTH,
+    MAX_LOGIN_PASSWORD_LENGTH,
     SUPERUSER_ROLE_NAME,
     PasswordPolicyError,
+    PasswordTooLongError,
     _ip_allowed,
+    check_password_length,
     has_roles_subset,
     validate_password_strength,
 )
@@ -153,6 +157,13 @@ async def _authenticate_credentials(
     failure — unknown identifier, wrong password, locked, or inactive."""
     if not email and not username:
         arc.relay.throw("email or username is required", code="identifier_required")
+
+    # Nothing legitimate is this long, so it is turned away before anything is spent on it - no rate-limit key
+    # built from it (the identifier is part of one: an unbounded identifier planted a Redis key as big as the
+    # request), no lookup, no Argon2. It is answered and counted like any wrong password: same message, same
+    # pause, one more failure against the source address's budget - so it also tells nobody anything.
+    if len(email or username or "") > MAX_IDENTIFIER_LENGTH or len(password) > MAX_LOGIN_PASSWORD_LENGTH:
+        await _reject_credentials(client_ip)
 
     # Two lookup fields, one auth path — a real second capability (not
     # every "add a field" also means "and let it authenticate with"), added
@@ -576,6 +587,9 @@ async def forgot_password(email: str, client_ip: str | None = None) -> dict:
     login's own credential-guessing surface, and closing it fully would
     mean spending a real email send on every guess. A deliberate, flagged
     simplification, not an oversight."""
+    # Before the rate-limit key below is built from it: no address is this long (see MAX_IDENTIFIER_LENGTH).
+    if len(email) > MAX_IDENTIFIER_LENGTH:
+        arc.relay.throw("email is too long", status=400, code="invalid_email")
     email = email.strip().lower()
 
     # Keyed the same (client_ip, identifier) shape as login()'s own rate
@@ -647,6 +661,13 @@ async def reset_password(token: str, new_password: str, client_ip: str | None = 
     rate_key = f"reset-password:{client_ip or 'unknown'}"
     if not await arc.authn.rate_limit(rate_key, limit=20, window_seconds=300):
         arc.relay.throw("too many requests, try again shortly", status=429, code="rate_limited")
+
+    # Before the token lookup and before zxcvbn: this endpoint is open to anyone holding a reset link, and the
+    # strength check's cost grows faster than the password's length.
+    try:
+        check_password_length(new_password)
+    except PasswordTooLongError as exc:
+        arc.relay.throw(str(exc), status=400, code="password_too_long")
 
     token_hash = arc.hash(token)
     # A first, cheap look so a token that is plainly wrong never costs a zxcvbn score and an

@@ -129,6 +129,23 @@ _ACCESS_KEY_RE = re.compile(r"ak_[A-Za-z0-9_-]{43,128}")
 # used to look the row up before verifying the full key's hash.
 KEY_PREFIX_LEN = 12
 
+#: The longest password accepted when one is SET (`arc authn create-user` / `set-password`, a reset link, the
+#: admin console). It is zxcvbn's own limit (its `max_length`, 72): the strength check refuses anything longer with a
+#: bare ValueError, which used to surface as an HTTP 500 on /reset-password and a traceback on the command line.
+#: Checking it first turns that into a clear 400 and keeps whatever is over the limit away from the scorer and the
+#: hasher. 72 is more than a person types and above the 64 NIST asks every system to accept.
+MAX_PASSWORD_LENGTH = 72
+
+#: The longest password a LOGIN attempt may carry before it is turned away without any hashing. Higher than
+#: MAX_PASSWORD_LENGTH on purpose: a password set before that limit existed (through an older `arc authn set-password`)
+#: may be longer than 72 and must still let its owner in. Nothing legitimate is anywhere near this.
+MAX_LOGIN_PASSWORD_LENGTH = 1024
+
+#: The longest e-mail address or username a sign-in or reset request may name (`_users.email` is 255 wide,
+#: `username` 32). The identifier is part of the rate-limit key (`login:<ip>:<identifier>`), so an unbounded one
+#: let each request plant a key as big as the request body in Redis.
+MAX_IDENTIFIER_LENGTH = 255
+
 #: The tables consume_one_time_token() may touch - interpolated into SQL, so a closed list.
 _ONE_TIME_TOKEN_TABLES = frozenset({"_password_resets", "_impersonation_tickets"})
 
@@ -217,6 +234,17 @@ class PasswordPolicyError(ValueError):
     pass
 
 
+class PasswordTooLongError(PasswordPolicyError):
+    """The password is longer than MAX_PASSWORD_LENGTH - refused before anything is spent on scoring or hashing it."""
+
+
+def check_password_length(password: str) -> None:
+    """Raises PasswordTooLongError for a password over MAX_PASSWORD_LENGTH characters. Cheap, so call it first,
+    before zxcvbn (which refuses the same input, but with a bare ValueError) or Argon2."""
+    if len(password) > MAX_PASSWORD_LENGTH:
+        raise PasswordTooLongError(f"password is too long: at most {MAX_PASSWORD_LENGTH} characters")
+
+
 def validate_password_strength(
     password: str, *, min_score: int, user_inputs: list[str] | None = None
 ) -> None:
@@ -234,6 +262,7 @@ def validate_password_strength(
     (the CLI's create-user/set-password today)."""
     from zxcvbn import zxcvbn
 
+    check_password_length(password)  # first: zxcvbn itself would refuse it with a bare ValueError (max_length 72)
     result = zxcvbn(password, user_inputs=user_inputs or [])
     if result["score"] < min_score:
         feedback = result.get("feedback") or {}
@@ -339,6 +368,11 @@ class AuthnProvider:
 
     def min_password_score(self) -> int:
         return self._kernel.settings.get(MIN_PASSWORD_SCORE_KEY)
+
+    def max_password_length(self) -> int:
+        """The longest password that may be set (MAX_PASSWORD_LENGTH). Public so other plugins that take a
+        new password (the admin console) apply the same bound instead of keeping a copy of the number."""
+        return MAX_PASSWORD_LENGTH
 
     def reset_token_ttl_seconds(self) -> int:
         return self._kernel.settings.get(RESET_TOKEN_TTL_MINUTES_KEY) * 60
